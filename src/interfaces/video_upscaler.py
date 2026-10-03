@@ -377,8 +377,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
 
-        # Opt-in acceleration
-        bf16_dit = dit.get("bf16_dit", False)
+        # Acceleration settings
+        bf16_dit = dit.get("bf16_dit", True)
         fp8_dit = dit.get("fp8_dit", False)
         fused_vae = vae.get("fused_vae", False)
         

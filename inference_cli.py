@@ -1451,13 +1451,14 @@ Examples:
     perf_group.add_argument("--attention_mode", type=str, default="sdpa",
                         choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
                         help="Attention backend: 'sdpa' (default), 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3' (Blackwell GPUs)")
-    perf_group.add_argument("--bf16_dit", action="store_true",
+    perf_group.add_argument("--bf16_dit", action=argparse.BooleanOptionalAction, default=True,
                         help="Convert FP16 DiT weights to BF16 at load time: removes per-call weight casts and autocast "
-                             "(same VRAM, no quantization). CUDA only; FP8 and GGUF models are left as loaded")
+                             "(same VRAM, no quantization). CUDA only; FP8 and GGUF models are left as loaded "
+                             "(default: enabled, --no-bf16_dit keeps the FP16 weights)")
     perf_group.add_argument("--fp8_dit", action="store_true",
                         help="Run the DiT block linear layers as FP8 GEMM (faster, lower VRAM, small quality change). "
                              "Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton; not for GGUF models. "
-                             "Best combined with --bf16_dit and --compile_dit")
+                             "Best combined with --compile_dit")
     perf_group.add_argument("--fused_vae", action="store_true",
                         help="Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels "
                              "(faster encode/decode, VAE runs in FP16). Requires CUDA and comfy-kitchen (pip install comfy-kitchen)")

@@ -805,7 +805,7 @@ def configure_runner(
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None,
-    bf16_dit: bool = False,
+    bf16_dit: bool = True,
     fp8_dit: bool = False,
     fused_vae: bool = False
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
@@ -835,7 +835,8 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
-        bf16_dit: Convert FP16 DiT weights to BF16 at load time (no per-call weight casts, no autocast)
+        bf16_dit: Convert FP16 DiT weights to BF16 at load time (no per-call weight casts, no autocast).
+                  Enabled by default; skipped where it doesn't apply (non-CUDA, FP8 or GGUF weights)
         fp8_dit: Run the DiT block linear layers as FP8 GEMM
         fused_vae: Run the VAE through the fused GroupNorm+SiLU / fp16-accumulate conv path (comfy-kitchen)
         
@@ -848,7 +849,7 @@ def configure_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
-        - Opt-in acceleration; settings that can't run on this system fall back to the standard path
+        - Acceleration settings; those that can't run on this system fall back to the standard path
         
     Raises:
         ValueError: If debug instance is not provided
@@ -1134,7 +1135,7 @@ def _setup_dit_model(
         # Create new DiT model
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
         
-        # Resolve opt-in acceleration (sets the DiT dtype override and the FP8 GEMM flag)
+        # Resolve acceleration settings (sets the DiT dtype override and the FP8 GEMM flag)
         _resolve_dit_acceleration(runner, dit_checkpoint_path, new_accel_config, debug)
         
         runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
@@ -1256,10 +1257,11 @@ def _resolve_dit_acceleration(
     debug: Optional['Debug'] = None
 ) -> None:
     """
-    Decide which opt-in DiT accelerations apply to a model about to be created.
+    Decide which DiT accelerations apply to a model about to be created.
     
-    A requested setting that can't run on this system or with this checkpoint is
-    skipped with a warning and the standard path runs unchanged.
+    A setting that can't run on this system or with this checkpoint is skipped and the
+    standard path runs unchanged. FP8 GEMM is opt-in, so skipping it logs a warning;
+    BF16 weights are on by default, so skipping them only shows in debug mode.
     
     Sets on the runner:
         _dit_dtype_override: compute dtype if FP16 weights are to be converted to BF16
@@ -1293,8 +1295,7 @@ def _resolve_dit_acceleration(
         if reason is None:
             runner._dit_dtype_override = compute_dtype
         else:
-            debug.log(f"DiT BF16 weights unavailable, using standard path: {reason}", 
-                     level="WARNING", category="dit", force=True)
+            debug.log(f"DiT BF16 weight conversion skipped: {reason}", category="precision")
     
     if accel_config.get('fp8_gemm', False):
         reason = get_fp8_gemm_unsupported_reason(device, compute_dtype)

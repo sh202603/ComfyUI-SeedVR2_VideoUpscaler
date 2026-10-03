@@ -523,8 +523,8 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     debug.start_timer(f"{model_type}_materialize")
     
     # Load weights (this materializes from meta to target device)
-    # The DiT override (bf16_dit) only converts FP16 checkpoints: converting FP8 weights
-    # would double their memory. The VAE override converts any floating point weights.
+    # The DiT override (bf16_dit, on by default) only converts FP16 checkpoints: converting
+    # FP8 weights would double their memory. The VAE override converts any floating point weights.
     override_source_dtype = torch.float16 if is_dit else None
     model = _load_model_weights(model, checkpoint_path, target_device, True,
                                model_type_upper, offload_reason, debug, override_dtype,
@@ -623,13 +623,10 @@ def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dty
         if float_dtypes != {source_dtype}:
             found = ', '.join(sorted(str(d) for d in float_dtypes))
             debug.log(f"Keeping {model_type} weights as loaded: conversion to {target_dtype} "
-                     f"only applies to {source_dtype} weights (found {found})", 
-                     category="precision", force=True)
+                     f"only applies to {source_dtype} weights (found {found})", category="precision")
             return state
     
-    # A source-restricted conversion is opt-in (bf16_dit): always report it
-    debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision",
-             force=source_dtype is not None)
+    debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision")
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
     
     for key in state:

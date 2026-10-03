@@ -118,11 +118,12 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     )
                 ),
                 io.Boolean.Input("bf16_dit",
-                    default=False,
+                    default=True,
                     optional=True,
                     tooltip=(
-                        "Convert FP16 weights to BF16 when the model is loaded.\n"
+                        "Convert FP16 weights to BF16 when the model is loaded (default: enabled).\n"
                         "Removes the per-call weight casts and autocast (same VRAM, no quantization).\n"
+                        "Disable to keep the FP16 weights as loaded.\n"
                         "\n"
                         "CUDA only. FP8 and GGUF models are left as loaded.\n"
                         "Changing this setting reloads the model."
@@ -134,7 +135,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                     tooltip=(
                         "Run the transformer block linear layers as FP8 GEMM.\n"
                         "Faster and lower VRAM, with a small quality change.\n"
-                        "Best combined with bf16_dit and torch.compile.\n"
+                        "Best combined with torch.compile.\n"
                         "\n"
                         "Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton.\n"
                         "Not available for GGUF models. Falls back to the standard path if unsupported.\n"
@@ -160,7 +161,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
-                     bf16_dit: bool = False, fp8_dit: bool = False,
+                     bf16_dit: bool = True, fp8_dit: bool = False,
                      torch_compile_args: Dict[str, Any] = None) -> io.NodeOutput:
         """
         Create DiT model configuration for SeedVR2 main node

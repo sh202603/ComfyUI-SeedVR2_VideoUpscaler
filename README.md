@@ -469,13 +469,13 @@ Configure the DiT (Diffusion Transformer) model for video upscaling.
   - `sageattn_2`: SageAttention 2 (requires sageattention package)
   - `sageattn_3`: SageAttention 3 (Blackwell/RTX 50xx, requires sageattn3 package)
 
-- **bf16_dit**: Convert FP16 weights to BF16 when the model is loaded (default: off)
+- **bf16_dit**: Convert FP16 weights to BF16 when the model is loaded (default: on)
   - Removes the per-call weight casts and autocast; same VRAM, no quantization
   - CUDA only. FP8 and GGUF models are left as loaded
-  - Changing this setting reloads the model
+  - Disable to keep the FP16 weights. Changing this setting reloads the model
 
 - **fp8_dit**: Run the transformer block linear layers as FP8 GEMM (default: off)
-  - Faster and lower VRAM, with a small quality change. Best combined with bf16_dit and torch.compile
+  - Faster and lower VRAM, with a small quality change. Best combined with torch.compile
   - Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton. Not available for GGUF models
   - Falls back to the standard path if unsupported. Changing this setting reloads the model
 
@@ -947,8 +947,8 @@ python inference_cli.py media_folder/ \
 **Performance Optimization:**
 - `--allow_vram_overflow`: Allow VRAM overflow to system RAM. Prevents OOM but may cause severe slowdown
 - `--attention_mode`: Attention backend: 'sdpa' (default), 'flash_attn_2' (Ampere+), 'flash_attn_3' (Hopper+), 'sageattn_2', or 'sageattn_3' (Blackwell)
-- `--bf16_dit`: Convert FP16 DiT weights to BF16 at load time: removes per-call weight casts and autocast (same VRAM, no quantization). CUDA only; FP8 and GGUF models are left as loaded
-- `--fp8_dit`: Run the DiT block linear layers as FP8 GEMM (faster, lower VRAM, small quality change). Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton; not for GGUF models. Best combined with `--bf16_dit` and `--compile_dit`
+- `--bf16_dit` / `--no-bf16_dit`: Convert FP16 DiT weights to BF16 at load time: removes per-call weight casts and autocast (same VRAM, no quantization). CUDA only; FP8 and GGUF models are left as loaded (default: enabled)
+- `--fp8_dit`: Run the DiT block linear layers as FP8 GEMM (faster, lower VRAM, small quality change). Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton; not for GGUF models. Best combined with `--compile_dit`
 - `--fused_vae`: Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels (faster encode/decode, VAE runs in FP16). Requires CUDA and comfy-kitchen (`pip install comfy-kitchen`)
 - `--compile_dit`: Enable torch.compile for DiT model (20-40% speedup, requires PyTorch 2.0+ and Triton)
 - `--compile_vae`: Enable torch.compile for VAE model (15-25% speedup, requires PyTorch 2.0+ and Triton)

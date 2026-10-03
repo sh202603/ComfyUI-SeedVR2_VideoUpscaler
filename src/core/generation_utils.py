@@ -439,7 +439,7 @@ def prepare_runner(
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None,
-    bf16_dit: bool = False,
+    bf16_dit: bool = True,
     fp8_dit: bool = False,
     fused_vae: bool = False
 ) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
@@ -468,7 +468,8 @@ def prepare_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
-        bf16_dit: Convert FP16 DiT weights to BF16 at load time (no per-call weight casts, no autocast)
+        bf16_dit: Convert FP16 DiT weights to BF16 at load time (no per-call weight casts, no autocast).
+                  Enabled by default; skipped where it doesn't apply (non-CUDA, FP8 or GGUF weights)
         fp8_dit: Run the DiT block linear layers as FP8 GEMM
         fused_vae: Run the VAE through the fused GroupNorm+SiLU / fp16-accumulate conv path (comfy-kitchen)
         
