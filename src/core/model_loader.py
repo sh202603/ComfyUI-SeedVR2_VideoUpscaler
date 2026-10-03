@@ -523,8 +523,12 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     debug.start_timer(f"{model_type}_materialize")
     
     # Load weights (this materializes from meta to target device)
+    # The DiT override (bf16_dit) only converts FP16 checkpoints: converting FP8 weights
+    # would double their memory. The VAE override converts any floating point weights.
+    override_source_dtype = torch.float16 if is_dit else None
     model = _load_model_weights(model, checkpoint_path, target_device, True,
-                               model_type_upper, offload_reason, debug, override_dtype) 
+                               model_type_upper, offload_reason, debug, override_dtype,
+                               override_source_dtype) 
    
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
     # Import here to avoid circular dependency 
@@ -546,7 +550,8 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
 
 def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_device: torch.device, 
                         used_meta: bool, model_type: str, cpu_reason: str, 
-                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
+                        debug: Optional['Debug'] = None, override_dtype: Optional[torch.dtype] = None,
+                        override_source_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
     """
     Load model weights from checkpoint file with optimized GGUF support.
     
@@ -562,6 +567,8 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
         cpu_reason: Reason string if using CPU
         debug: Debug instance
         override_dtype: Optional dtype override for weights
+        override_source_dtype: If set, the override only applies when all floating point
+                               weights have this dtype
         
     Returns:
         Model with loaded weights
@@ -581,7 +588,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     
     # Apply dtype conversion if requested
     if override_dtype is not None:
-        state = _convert_state_dtype(state, override_dtype, model_type, debug)
+        state = _convert_state_dtype(state, override_dtype, model_type, debug, override_source_dtype)
     
     # Log weight statistics
     _log_weight_stats(state, used_meta, model_type, debug)
@@ -603,9 +610,26 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
 
 
 def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dtype, 
-                        model_type: str, debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
-    """Convert floating point tensors in state dict to target dtype."""
-    debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision")
+                        model_type: str, debug: Optional['Debug'] = None,
+                        source_dtype: Optional[torch.dtype] = None) -> Dict[str, torch.Tensor]:
+    """
+    Convert floating point tensors in state dict to target dtype.
+    
+    If source_dtype is given, the conversion only applies when every floating point
+    tensor has that dtype; otherwise the weights are kept as loaded.
+    """
+    if source_dtype is not None:
+        float_dtypes = {t.dtype for t in state.values() if torch.is_tensor(t) and t.is_floating_point()}
+        if float_dtypes != {source_dtype}:
+            found = ', '.join(sorted(str(d) for d in float_dtypes))
+            debug.log(f"Keeping {model_type} weights as loaded: conversion to {target_dtype} "
+                     f"only applies to {source_dtype} weights (found {found})", 
+                     category="precision", force=True)
+            return state
+    
+    # A source-restricted conversion is opt-in (bf16_dit): always report it
+    debug.log(f"Converting {model_type} weights to {target_dtype} during loading", category="precision",
+             force=source_dtype is not None)
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
     
     for key in state:

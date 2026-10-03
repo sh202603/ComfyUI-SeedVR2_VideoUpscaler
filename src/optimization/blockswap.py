@@ -149,10 +149,11 @@ def get_module_memory_mb(module: torch.nn.Module) -> float:
     Returns:
         Memory usage in megabytes
     """
+    # Buffers are included: FP8 GEMM layers keep their weights as buffers
     total_bytes = sum(
-        param.nelement() * param.element_size() 
-        for param in module.parameters() 
-        if param.data is not None
+        tensor.nelement() * tensor.element_size() 
+        for tensor in list(module.parameters()) + list(module.buffers())
+        if tensor.data is not None
     )
     return total_bytes / (1024 * 1024)
 

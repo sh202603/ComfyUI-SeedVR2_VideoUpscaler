@@ -438,7 +438,10 @@ def prepare_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    bf16_dit: bool = False,
+    fp8_dit: bool = False,
+    fused_vae: bool = False
 ) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
     """
     Prepare runner with model state management and global cache integration.
@@ -465,6 +468,9 @@ def prepare_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        bf16_dit: Convert FP16 DiT weights to BF16 at load time (no per-call weight casts, no autocast)
+        fp8_dit: Run the DiT block linear layers as FP8 GEMM
+        fused_vae: Run the VAE through the fused GroupNorm+SiLU / fp16-accumulate conv path (comfy-kitchen)
         
     Returns:
         Tuple['VideoDiffusionInfer', Dict[str, Any]]: Tuple containing:
@@ -508,7 +514,10 @@ def prepare_runner(
         tile_debug=tile_debug,
         attention_mode=attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        bf16_dit=bf16_dit,
+        fp8_dit=fp8_dit,
+        fused_vae=fused_vae
     )
 
     return runner, cache_context

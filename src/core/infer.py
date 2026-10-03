@@ -156,8 +156,12 @@ class VideoDiffusionInfer():
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
                 # Instead, explicitly convert input to model dtype
+                # Fused VAE path: same explicit conversion (its fp16 kernels need fp16 input),
+                # and the latent is converted back to the input dtype below
+                fused_path = getattr(self.vae, 'fused_path', False)
+                input_dtype = sample.dtype
                 if vae_dtype != sample.dtype:
-                    if device.type == 'mps':
+                    if device.type == 'mps' or fused_path:
                         # MPS: explicit dtype conversion instead of autocast
                         sample = sample.to(vae_dtype)
                         if use_sample:
@@ -182,6 +186,9 @@ class VideoDiffusionInfer():
                         # Deterministic vae encode, only used for i2v inference (optionally)
                         latent = self.vae.encode(sample, tiled=self.encode_tiled, tile_size=self.encode_tile_size,
                                             tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
+
+                if fused_path and latent.dtype != input_dtype:
+                    latent = latent.to(input_dtype)
 
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
                 latent = optimized_channels_to_last(latent)
@@ -242,8 +249,12 @@ class VideoDiffusionInfer():
 
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
+                # Fused VAE path: same explicit conversion (its fp16 kernels need fp16 input),
+                # and the sample is converted back to the latent dtype below
+                fused_path = getattr(self.vae, 'fused_path', False)
+                input_dtype = latent.dtype
                 if vae_dtype != latent.dtype:
-                    if device.type == 'mps':
+                    if device.type == 'mps' or fused_path:
                         # MPS: explicit dtype conversion instead of autocast
                         latent = latent.to(vae_dtype)
                         sample = self.vae.decode(
@@ -264,6 +275,9 @@ class VideoDiffusionInfer():
                         tiled=self.decode_tiled, tile_size=self.decode_tile_size,
                         tile_overlap=self.decode_tile_overlap
                     ).sample
+
+                if fused_path and sample.dtype != input_dtype:
+                    sample = sample.to(input_dtype)
 
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)

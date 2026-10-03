@@ -937,7 +937,10 @@ def _process_frames_core(
         tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
         attention_mode=args.attention_mode,
         torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
+        torch_compile_args_vae=torch_compile_args_vae,
+        bf16_dit=args.bf16_dit,
+        fp8_dit=args.fp8_dit,
+        fused_vae=args.fused_vae
     )
     
     ctx['cache_context'] = cache_context
@@ -1448,6 +1451,16 @@ Examples:
     perf_group.add_argument("--attention_mode", type=str, default="sdpa",
                         choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"],
                         help="Attention backend: 'sdpa' (default), 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3' (Blackwell GPUs)")
+    perf_group.add_argument("--bf16_dit", action="store_true",
+                        help="Convert FP16 DiT weights to BF16 at load time: removes per-call weight casts and autocast "
+                             "(same VRAM, no quantization). CUDA only; FP8 and GGUF models are left as loaded")
+    perf_group.add_argument("--fp8_dit", action="store_true",
+                        help="Run the DiT block linear layers as FP8 GEMM (faster, lower VRAM, small quality change). "
+                             "Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton; not for GGUF models. "
+                             "Best combined with --bf16_dit and --compile_dit")
+    perf_group.add_argument("--fused_vae", action="store_true",
+                        help="Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels "
+                             "(faster encode/decode, VAE runs in FP16). Requires CUDA and comfy-kitchen (pip install comfy-kitchen)")
     perf_group.add_argument("--compile_dit", action="store_true", 
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",

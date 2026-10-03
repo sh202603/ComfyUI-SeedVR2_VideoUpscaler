@@ -376,6 +376,11 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
         # TorchCompile args (optional connection, can be None)
         dit_torch_compile_args = dit.get("torch_compile_args")
         vae_torch_compile_args = vae.get("torch_compile_args")
+
+        # Opt-in acceleration
+        bf16_dit = dit.get("bf16_dit", False)
+        fp8_dit = dit.get("fp8_dit", False)
+        fused_vae = vae.get("fused_vae", False)
         
         # Print header
         debug.print_header()
@@ -433,7 +438,10 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 tile_debug=tile_debug,
                 attention_mode=attention_mode,
                 torch_compile_args_dit=dit_torch_compile_args,
-                torch_compile_args_vae=vae_torch_compile_args
+                torch_compile_args_vae=vae_torch_compile_args,
+                bf16_dit=bf16_dit,
+                fp8_dit=fp8_dit,
+                fused_vae=fused_vae
             )
 
             # Store cache context in ctx for use in generation phases

@@ -9,6 +9,7 @@ This module orchestrates model configuration, caching, and runtime settings:
 - torch.compile integration
 - BlockSwap configuration
 - VAE tiling configuration
+- Opt-in acceleration (BF16 weights, FP8 GEMM, VAE fused path) with fallback
 
 Key Features:
 - Unified runner configuration via configure_runner()
@@ -37,11 +38,14 @@ Configuration Helpers:
 - _describe_compile_config: Human-readable torch.compile description
 - _describe_attention_mode: Human-readable attention mode description
 - _describe_tiling_config: Human-readable VAE tiling description
+- _describe_accel_config: Human-readable acceleration description
 - _update_model_config: Generic config update handler with change detection
 
 Model Setup:
 - _setup_dit_model: Setup DiT model from cache or create new structure
 - _setup_vae_model: Setup VAE model from cache or create new structure
+- _resolve_dit_acceleration: Decide which DiT accelerations apply (or fall back)
+- _resolve_vae_acceleration: Decide whether the VAE fused path applies (or fall back)
 
 torch.compile Support:
 - _configure_torch_compile: Configure torch.compile settings
@@ -75,6 +79,8 @@ from ..optimization.compatibility import (
     validate_attention_mode
 )
 from ..optimization.blockswap import is_blockswap_enabled, validate_blockswap_config, apply_block_swap_to_dit, cleanup_blockswap
+from ..optimization.fp8_gemm import convert_dit_to_fp8_gemm, get_fp8_gemm_unsupported_reason
+from ..optimization.vae_fusion import enable_vae_fused_path, get_vae_fused_path_unsupported_reason
 from ..optimization.memory_manager import cleanup_dit, cleanup_vae
 from ..utils.constants import find_model_file
 
@@ -218,6 +224,37 @@ def _describe_tiling_config(encode_tiled: bool, encode_tile_size: Optional[Tuple
         parts.append(f"decode Tile: {decode_tile_size}, Overlap: {decode_tile_overlap}")
     
     return "; ".join(parts)
+
+
+# Display names of the opt-in acceleration settings
+_ACCEL_NAMES = {
+    'bf16_weights': 'BF16 weights',
+    'fp8_gemm': 'FP8 GEMM',
+    'fused_path': 'fused path'
+}
+
+
+def _describe_accel_config(config: Optional[Dict[str, Any]]) -> str:
+    """
+    Generate human-readable description of acceleration settings.
+    
+    Args:
+        config: Acceleration configuration dict mapping setting names to bool
+        
+    Returns:
+        Human-readable description string
+    """
+    enabled = [_ACCEL_NAMES.get(name, name) for name, value in (config or {}).items() if value]
+    return f"enabled ({', '.join(enabled)})" if enabled else "disabled"
+
+
+def _accel_configs_equal(config1: Optional[Dict[str, Any]], config2: Optional[Dict[str, Any]]) -> bool:
+    """
+    Compare two acceleration configs. A missing config equals all settings disabled.
+    """
+    enabled1 = {name for name, value in (config1 or {}).items() if value}
+    enabled2 = {name for name, value in (config2 or {}).items() if value}
+    return enabled1 == enabled2
 
     
 def _update_model_config(
@@ -536,14 +573,17 @@ def _initialize_cache_context(
     vae_id: Optional[int],
     dit_model: str,
     vae_model: str,
-    debug: Optional['Debug'] = None
+    debug: Optional['Debug'] = None,
+    dit_accel_config: Optional[Dict[str, Any]] = None,
+    vae_accel_config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Initialize cache context with global cache lookups and model name validation.
     
     Checks the global cache for existing DiT/VAE models and validates that cached
     models match the requested model names. Removes stale cache entries when model
-    names don't match.
+    names don't match, or when the acceleration settings changed: those rewrite the
+    weights at load time, so the cached model can't be reconfigured and is reloaded.
     
     Args:
         dit_cache: Whether DiT caching is enabled
@@ -553,6 +593,8 @@ def _initialize_cache_context(
         dit_model: Requested DiT model filename for validation
         vae_model: Requested VAE model filename for validation
         debug: Debug instance for logging
+        dit_accel_config: Requested DiT acceleration settings for validation
+        vae_accel_config: Requested VAE acceleration settings for validation
         
     Returns:
         Dict[str, Any]: Cache context dictionary containing:
@@ -597,15 +639,21 @@ def _initialize_cache_context(
         if cached_model is not None:
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
-            if cached_model_name == dit_model:
-                # Cache hit with valid model - reuse it
-                context['cached_dit'] = cached_model
-            else:
+            cached_accel_config = getattr(cached_model, '_config_accel', None)
+            if cached_model_name != dit_model:
                 # Model changed - remove stale cache and log the change
                 if cached_model_name:
                     debug.log(f"DiT model changed in cache ({cached_model_name} → {dit_model}), "
                              f"removing stale cached model", category="cache", force=True)
                 global_cache.remove_dit({'node_id': dit_id}, debug)
+            elif not _accel_configs_equal(cached_accel_config, dit_accel_config):
+                # Acceleration changed - weights were rewritten at load time, reload required
+                debug.log(f"DiT acceleration changed in cache ({_describe_accel_config(cached_accel_config)} → "
+                         f"{_describe_accel_config(dit_accel_config)}), reloading model", category="cache", force=True)
+                global_cache.remove_dit({'node_id': dit_id}, debug)
+            else:
+                # Cache hit with valid model - reuse it
+                context['cached_dit'] = cached_model
     else:
         # Caching disabled or no ID - clean up any existing cache for this node
         if dit_id is not None:
@@ -617,14 +665,20 @@ def _initialize_cache_context(
         if cached_model is not None:
             # Verify cached model matches requested model by checking _model_name attribute
             cached_model_name = getattr(cached_model, '_model_name', None)
-            if cached_model_name == vae_model:
-                context['cached_vae'] = cached_model
-            else:
+            cached_accel_config = getattr(cached_model, '_config_accel', None)
+            if cached_model_name != vae_model:
                 # Model changed - remove stale cache and log the change
                 if cached_model_name:
                     debug.log(f"VAE model changed in cache ({cached_model_name} → {vae_model}), "
                              f"removing stale cached model", category="cache", force=True)
                 global_cache.remove_vae({'node_id': vae_id}, debug)
+            elif not _accel_configs_equal(cached_accel_config, vae_accel_config):
+                # Acceleration changed - weights were loaded in a different dtype, reload required
+                debug.log(f"VAE acceleration changed in cache ({_describe_accel_config(cached_accel_config)} → "
+                         f"{_describe_accel_config(vae_accel_config)}), reloading model", category="cache", force=True)
+                global_cache.remove_vae({'node_id': vae_id}, debug)
+            else:
+                context['cached_vae'] = cached_model
     else:
         if vae_id is not None:
             global_cache.remove_vae({'node_id': vae_id}, debug)
@@ -750,7 +804,10 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    bf16_dit: bool = False,
+    fp8_dit: bool = False,
+    fused_vae: bool = False
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -778,6 +835,9 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        bf16_dit: Convert FP16 DiT weights to BF16 at load time (no per-call weight casts, no autocast)
+        fp8_dit: Run the DiT block linear layers as FP8 GEMM
+        fused_vae: Run the VAE through the fused GroupNorm+SiLU / fp16-accumulate conv path (comfy-kitchen)
         
     Returns:
         Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
@@ -788,6 +848,7 @@ def configure_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
+        - Opt-in acceleration; settings that can't run on this system fall back to the standard path
         
     Raises:
         ValueError: If debug instance is not provided
@@ -804,10 +865,15 @@ def configure_runner(
         debug=debug
     )
     
+    # Acceleration settings as requested (availability is resolved when the model is created)
+    dit_accel_config = {'bf16_weights': bool(bf16_dit), 'fp8_gemm': bool(fp8_dit)}
+    vae_accel_config = {'fused_path': bool(fused_vae)}
+    
     # Phase 1: Initialize cache and get cached models
     cache_context = _initialize_cache_context(
         dit_cache, vae_cache, dit_id, vae_id, 
-        dit_model, vae_model, debug
+        dit_model, vae_model, debug,
+        dit_accel_config, vae_accel_config
     )
     
     # Phase 2: Get or create runner
@@ -823,7 +889,8 @@ def configure_runner(
         decode_tiled, decode_tile_size, decode_tile_overlap,
         tile_debug, attention_mode,
         torch_compile_args_dit, torch_compile_args_vae,
-        block_swap_config, debug
+        block_swap_config, debug,
+        dit_accel_config, vae_accel_config
     )
     
     # Phase 4: Setup models (load from cache or create new)
@@ -849,7 +916,9 @@ def _configure_runner_settings(
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
-    debug: Optional['Debug'] = None
+    debug: Optional['Debug'] = None,
+    dit_accel_config: Optional[Dict[str, Any]] = None,
+    vae_accel_config: Optional[Dict[str, Any]] = None
 ) -> None:
     """
     Configure runner settings for VAE tiling, torch.compile, and BlockSwap.
@@ -874,6 +943,8 @@ def _configure_runner_settings(
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
         debug: Debug instance (stored on runner for model access)
+        dit_accel_config: Requested DiT acceleration settings (bf16_weights, fp8_gemm)
+        vae_accel_config: Requested VAE acceleration settings (fused_path)
     """
     # VAE tiling settings
     runner.encode_tiled = encode_tiled
@@ -890,6 +961,8 @@ def _configure_runner_settings(
     runner._new_vae_compile_args = torch_compile_args_vae
     runner._new_dit_block_swap_config = block_swap_config
     runner._new_dit_attention_mode = attention_mode
+    runner._new_dit_accel_config = dit_accel_config
+    runner._new_vae_accel_config = vae_accel_config
     runner._new_vae_tiling_config = {
         'encode_tiled': encode_tiled,
         'encode_tile_size': encode_tile_size,
@@ -964,6 +1037,7 @@ def _setup_models(
             runner.dit._config_compile = runner._new_dit_compile_args
             runner.dit._config_swap = runner._new_dit_block_swap_config
             runner.dit._config_attn = runner._new_dit_attention_mode
+            runner.dit._config_accel = runner._new_dit_accel_config
     
     # Setup VAE
     vae_created = _setup_vae_model(runner, cache_context, vae_model, base_cache_dir, debug)
@@ -979,9 +1053,11 @@ def _setup_models(
         if hasattr(runner, 'vae') and runner.vae:
             runner.vae._config_compile = runner._new_vae_compile_args
             runner.vae._config_tiling = runner._new_vae_tiling_config
+            runner.vae._config_accel = runner._new_vae_accel_config
     
     # Clean up temporary attributes
-    for attr in ['_new_dit_compile_args', '_new_vae_compile_args', '_new_dit_block_swap_config', '_new_dit_attention_mode', '_new_vae_tiling_config']:
+    for attr in ['_new_dit_compile_args', '_new_vae_compile_args', '_new_dit_block_swap_config', '_new_dit_attention_mode', '_new_vae_tiling_config',
+                 '_new_dit_accel_config', '_new_vae_accel_config']:
         if hasattr(runner, attr):
             delattr(runner, attr)
     
@@ -1000,7 +1076,7 @@ def _setup_dit_model(
     Setup DiT model from cache or create new meta device structure.
     
     Handles three scenarios:
-    1. Model changed: Cleanup old model, create new structure
+    1. Model or acceleration changed: Cleanup old model, create new structure
     2. Cached model available: Reuse cached model, restore config
     3. No model exists: Create new meta device structure
     
@@ -1026,6 +1102,16 @@ def _setup_dit_model(
                      category="cache", force=True)
             cleanup_dit(runner=runner, debug=debug, cache_model=False)
     
+    # Check if acceleration changed on a model kept from a previous run - it rewrote
+    # the weights at load time, so clean up the old model to reload it
+    new_accel_config = getattr(runner, '_new_dit_accel_config', None)
+    if cache_context['cached_dit'] is None and getattr(runner, 'dit', None) is not None:
+        current_accel_config = getattr(runner.dit, '_config_accel', None)
+        if not _accel_configs_equal(current_accel_config, new_accel_config):
+            debug.log(f"DiT acceleration changed ({_describe_accel_config(current_accel_config)} → "
+                     f"{_describe_accel_config(new_accel_config)}), cleaning old model", category="cache", force=True)
+            cleanup_dit(runner=runner, debug=debug, cache_model=False)
+    
     if cache_context['cached_dit'] is not None:
         # Reuse cached DiT model
         debug.log(f"Reusing cached DiT ({cache_context['dit_id']}): {dit_model}", 
@@ -1046,13 +1132,11 @@ def _setup_dit_model(
         return False
     elif not hasattr(runner, 'dit') or runner.dit is None:
         # Create new DiT model
-        # Set DiT dtype from runner's compute_dtype
-        # compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
-        # dit_dtype_str = str(compute_dtype).split('.')[-1]
-        # runner.config.dit.dtype = dit_dtype_str
-        # runner._dit_dtype_override = compute_dtype
-        
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
+        
+        # Resolve opt-in acceleration (sets the DiT dtype override and the FP8 GEMM flag)
+        _resolve_dit_acceleration(runner, dit_checkpoint_path, new_accel_config, debug)
+        
         runner = prepare_model_structure(runner, "dit", dit_checkpoint_path, 
                                         runner.config, debug, block_swap_config)
         runner._dit_model_name = dit_model
@@ -1074,7 +1158,7 @@ def _setup_vae_model(
     Setup VAE model from cache or create new meta device structure.
     
     Handles three scenarios:
-    1. Model changed: Cleanup old model, configure and create new structure
+    1. Model or acceleration changed: Cleanup old model, configure and create new structure
     2. Cached model available: Reuse cached model, restore config
     3. No model exists: Configure VAE settings, create new meta device structure
     
@@ -1097,6 +1181,16 @@ def _setup_vae_model(
         if hasattr(runner, 'vae') and runner.vae is not None:
             debug.log(f"VAE model changed ({current_vae_name} → {vae_model}), cleaning old model", 
                      category="cache", force=True)
+            cleanup_vae(runner=runner, debug=debug, cache_model=False)
+    
+    # Check if acceleration changed on a model kept from a previous run - the weights
+    # were loaded in a different dtype, so clean up the old model to reload it
+    new_accel_config = getattr(runner, '_new_vae_accel_config', None)
+    if cache_context['cached_vae'] is None and getattr(runner, 'vae', None) is not None:
+        current_accel_config = getattr(runner.vae, '_config_accel', None)
+        if not _accel_configs_equal(current_accel_config, new_accel_config):
+            debug.log(f"VAE acceleration changed ({_describe_accel_config(current_accel_config)} → "
+                     f"{_describe_accel_config(new_accel_config)}), cleaning old model", category="cache", force=True)
             cleanup_vae(runner=runner, debug=debug, cache_model=False)
     
     if cache_context['cached_vae'] is not None:
@@ -1133,6 +1227,10 @@ def _setup_vae_model(
         runner._vae_dtype_override = compute_dtype
         
         vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+        
+        # Resolve opt-in acceleration (the fused path loads the weights as FP16 instead)
+        _resolve_vae_acceleration(runner, vae_checkpoint_path, new_accel_config, debug)
+        
         runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
                                         runner.config, debug, None)
         
@@ -1151,11 +1249,110 @@ def _setup_vae_model(
         return False
 
 
+def _resolve_dit_acceleration(
+    runner: VideoDiffusionInfer,
+    checkpoint_path: str,
+    accel_config: Optional[Dict[str, Any]],
+    debug: Optional['Debug'] = None
+) -> None:
+    """
+    Decide which opt-in DiT accelerations apply to a model about to be created.
+    
+    A requested setting that can't run on this system or with this checkpoint is
+    skipped with a warning and the standard path runs unchanged.
+    
+    Sets on the runner:
+        _dit_dtype_override: compute dtype if FP16 weights are to be converted to BF16
+                             at load time (the loader skips checkpoints that are not FP16)
+        _dit_fp8_gemm: True if the block linear layers are to be swapped for FP8 GEMM
+                       at materialization
+    
+    Args:
+        runner: VideoDiffusionInfer instance to setup
+        checkpoint_path: Path of the DiT checkpoint to be loaded
+        accel_config: Requested acceleration settings (bf16_weights, fp8_gemm)
+        debug: Debug instance for logging
+    """
+    accel_config = accel_config or {}
+    runner._dit_dtype_override = None
+    runner._dit_fp8_gemm = False
+    
+    device = torch.device(runner._dit_device)
+    compute_dtype = getattr(runner, '_compute_dtype', torch.bfloat16)
+    is_gguf = checkpoint_path is not None and checkpoint_path.endswith('.gguf')
+    
+    if accel_config.get('bf16_weights', False):
+        reason = None
+        if device.type != 'cuda' or getattr(torch.version, 'hip', None) is not None:
+            reason = "requires an NVIDIA CUDA device"
+        elif compute_dtype != torch.bfloat16:
+            reason = f"requires bfloat16 compute dtype (got {compute_dtype})"
+        elif is_gguf:
+            reason = "GGUF weights stay quantized in memory"
+        
+        if reason is None:
+            runner._dit_dtype_override = compute_dtype
+        else:
+            debug.log(f"DiT BF16 weights unavailable, using standard path: {reason}", 
+                     level="WARNING", category="dit", force=True)
+    
+    if accel_config.get('fp8_gemm', False):
+        reason = get_fp8_gemm_unsupported_reason(device, compute_dtype)
+        if reason is None and is_gguf:
+            reason = "GGUF weights stay quantized in memory"
+        
+        if reason is None:
+            runner._dit_fp8_gemm = True
+        else:
+            debug.log(f"DiT FP8 GEMM unavailable, using standard path: {reason}", 
+                     level="WARNING", category="dit", force=True)
+
+
+def _resolve_vae_acceleration(
+    runner: VideoDiffusionInfer,
+    checkpoint_path: str,
+    accel_config: Optional[Dict[str, Any]],
+    debug: Optional['Debug'] = None
+) -> None:
+    """
+    Decide whether the opt-in VAE fused path applies to a model about to be created.
+    
+    If it can't run on this system or with this checkpoint, it is skipped with a
+    warning and the standard path runs unchanged.
+    
+    Sets on the runner:
+        _vae_fused_path: True if the VAE is to be switched to the fused path at materialization
+        _vae_dtype_override: float16 instead of the compute dtype when the fused path
+                             applies (its kernels need FP16 weights)
+    
+    Args:
+        runner: VideoDiffusionInfer instance to setup
+        checkpoint_path: Path of the VAE checkpoint to be loaded
+        accel_config: Requested acceleration settings (fused_path)
+        debug: Debug instance for logging
+    """
+    runner._vae_fused_path = False
+    
+    if not (accel_config or {}).get('fused_path', False):
+        return
+    
+    reason = get_vae_fused_path_unsupported_reason(torch.device(runner._vae_device))
+    if reason is None and checkpoint_path is not None and checkpoint_path.endswith('.gguf'):
+        reason = "GGUF weights stay quantized in memory"
+    
+    if reason is None:
+        runner._vae_fused_path = True
+        runner._vae_dtype_override = torch.float16
+    else:
+        debug.log(f"VAE fused path unavailable, using standard path: {reason}", 
+                 level="WARNING", category="vae", force=True)
+
+
 def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionInfer, 
                                 config: OmegaConf, is_dit: bool, 
                                 debug: Optional['Debug'] = None) -> torch.nn.Module:
     """
-    Apply model-specific configurations (FP8, BlockSwap, torch.compile).
+    Apply model-specific configurations (FP8 GEMM, BlockSwap, torch.compile, VAE fused path).
     
     This function is idempotent and can be safely called on both newly materialized
     and already-configured models. It checks state flags to determine what needs
@@ -1164,6 +1361,7 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
     Critical: For DiT, BlockSwap must be applied BEFORE torch.compile.
     torch.compile captures the computational graph, so any wrapping done
     after compilation (like BlockSwap's forward wrapping) won't work.
+    The FP8 GEMM swap replaces block submodules, so it comes before both.
     
     Args:
         model: Loaded model instance
@@ -1187,6 +1385,14 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             debug.end_timer("CompatibleDiT", "Compatibility wrapper application")
         else:
             debug.log("Reusing existing DiT compatibility wrapper", category="reuse")
+        
+        # Swap block linear layers for FP8 GEMM (only once, the swap frees the original weights)
+        if getattr(runner, '_dit_fp8_gemm', False):
+            actual_model = model.dit_model if hasattr(model, 'dit_model') else model
+            if not getattr(actual_model, '_fp8_gemm_applied', False):
+                converted = convert_dit_to_fp8_gemm(actual_model, debug)
+                actual_model._fp8_gemm_applied = True
+                debug.log(f"DiT FP8 GEMM enabled: {converted} linear layers converted", category="dit", force=True)
         
         # Apply attention mode and compute_dtype to all FlashAttentionVarlen modules
         if hasattr(runner, '_dit_attention_mode'):
@@ -1258,6 +1464,12 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             debug.start_timer("vae_set_memory_limit")
             model.set_memory_limit(**config.vae.memory_limit)
             debug.end_timer("vae_set_memory_limit", "VAE memory limits configured")
+
+        # Switch to the fused path before torch.compile (only once)
+        if getattr(runner, '_vae_fused_path', False) and not getattr(model, 'fused_path', False):
+            convs, norm_owners = enable_vae_fused_path(model)
+            debug.log(f"VAE fused path enabled: {convs} convolutions with fp16 accumulation, "
+                     f"GroupNorm+SiLU fused in {norm_owners} modules", category="vae", force=True)
 
         # Apply torch.compile if configured (only if not already compiled)
         if hasattr(runner, '_vae_compile_args') and runner._vae_compile_args:

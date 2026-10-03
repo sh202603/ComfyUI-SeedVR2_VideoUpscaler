@@ -117,6 +117,30 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "Flash Attention and SageAttention provide speedup through optimized CUDA kernels on compatible GPUs."
                     )
                 ),
+                io.Boolean.Input("bf16_dit",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "Convert FP16 weights to BF16 when the model is loaded.\n"
+                        "Removes the per-call weight casts and autocast (same VRAM, no quantization).\n"
+                        "\n"
+                        "CUDA only. FP8 and GGUF models are left as loaded.\n"
+                        "Changing this setting reloads the model."
+                    )
+                ),
+                io.Boolean.Input("fp8_dit",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "Run the transformer block linear layers as FP8 GEMM.\n"
+                        "Faster and lower VRAM, with a small quality change.\n"
+                        "Best combined with bf16_dit and torch.compile.\n"
+                        "\n"
+                        "Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton.\n"
+                        "Not available for GGUF models. Falls back to the standard path if unsupported.\n"
+                        "Changing this setting reloads the model."
+                    )
+                ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
                     tooltip=(
@@ -136,6 +160,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
+                     bf16_dit: bool = False, fp8_dit: bool = False,
                      torch_compile_args: Dict[str, Any] = None) -> io.NodeOutput:
         """
         Create DiT model configuration for SeedVR2 main node
@@ -148,6 +173,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             blocks_to_swap: Number of transformer blocks to swap (requires offload_device != device)
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
             attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+            bf16_dit: Convert FP16 weights to BF16 at load time
+            fp8_dit: Run the transformer block linear layers as FP8 GEMM
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -173,6 +200,8 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "blocks_to_swap": blocks_to_swap,
             "swap_io_components": swap_io_components,
             "attention_mode": attention_mode,
+            "bf16_dit": bf16_dit,
+            "fp8_dit": fp8_dit,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
         }

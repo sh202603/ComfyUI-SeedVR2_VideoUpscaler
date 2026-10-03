@@ -146,6 +146,18 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                         "Requires offload_device to be set."
                     )
                 ),
+                io.Boolean.Input("fused_vae",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels.\n"
+                        "Faster encoding and decoding; the VAE runs in FP16 instead of BF16.\n"
+                        "\n"
+                        "Requires CUDA and the comfy-kitchen package.\n"
+                        "Not available for GGUF models. Falls back to the standard path if unsupported.\n"
+                        "Changing this setting reloads the model."
+                    )
+                ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
                     tooltip=(
@@ -167,6 +179,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                      encode_tile_size: int = 512, encode_tile_overlap: int = 64,
                      decode_tiled: bool = False, decode_tile_size: int = 512, 
                      decode_tile_overlap: int = 64, tile_debug: str = "false",
+                     fused_vae: bool = False,
                      torch_compile_args: Dict[str, Any] = None
                      ) -> io.NodeOutput:
         """
@@ -184,6 +197,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             decode_tile_size: Tile size for decoding
             decode_tile_overlap: Tile overlap for decoding
             tile_debug: Tile visualization mode (false/encode/decode)
+            fused_vae: Run the VAE through the fused GroupNorm+SiLU / fp16-accumulate conv path
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -213,6 +227,7 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
             "decode_tile_size": decode_tile_size,
             "decode_tile_overlap": decode_tile_overlap,
             "tile_debug": tile_debug,
+            "fused_vae": fused_vae,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
         }

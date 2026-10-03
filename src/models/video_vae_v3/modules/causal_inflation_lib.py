@@ -28,6 +28,7 @@ from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
 from ....optimization.memory_manager import retry_on_oom
 from ....optimization.compatibility import NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
+from ....optimization.vae_fusion import fp16_accum_conv3d, match_channels_last_3d
 
 # Single GPU inference - no distributed processing needed
 #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")
@@ -74,6 +75,7 @@ class InflatedCausalConv3d(Conv3d):
         self.memory_device = memory_device
         self.padding = (0, *self.padding[1:])  # Remove temporal pad to keep causal.
         self.memory_limit = float("inf")
+        self.fused_path = False  # Set by enable_vae_fused_path (fused_vae)
 
     def set_memory_limit(self, value: float):
         self.memory_limit = value
@@ -91,6 +93,10 @@ class InflatedCausalConv3d(Conv3d):
         Workaround: Call torch.cudnn_convolution directly to bypass buggy layer.
         Status is logged at startup in compatibility.py.
         """
+        # Fused VAE path: fp16-accumulate kernel, NDHWC in and out
+        if self.fused_path and input.dtype == torch.float16 and weight.dtype == torch.float16:
+            return fp16_accum_conv3d(input, weight, bias, self.stride, self.padding)
+        
         if (NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND and 
             weight.dtype in (torch.float16, torch.bfloat16) and 
             hasattr(torch.backends.cudnn, 'is_available') and
@@ -261,6 +267,10 @@ class InflatedCausalConv3d(Conv3d):
         cache = cache_send_recv(
             input, cache_size=cache_size, memory=self.memory, times=self.temporal_padding * 2
         )
+        # Fused VAE path: keep the carried-over frames in NDHWC like the input,
+        # so that concatenating them does not fall back to NCDHW
+        if self.fused_path and cache is not None:
+            cache = match_channels_last_3d(cache, input[0])
 
         # Single GPU inference - simplified memory management
         if (
@@ -273,7 +283,13 @@ class InflatedCausalConv3d(Conv3d):
                 input[0] = torch.cat([cache, input[0]], dim=2)
                 cache = None
             if cache_size <= input[-1].size(2):
-                self.memory = input[-1][:, :, -cache_size:].detach().contiguous()
+                memory = input[-1][:, :, -cache_size:].detach()
+                if self.fused_path and input[-1].is_contiguous(memory_format=torch.channels_last_3d):
+                    # Fused VAE path: keep NDHWC. A temporal slice of an NDHWC tensor is
+                    # already contiguous, so clone to not keep the whole input alive
+                    self.memory = memory.clone(memory_format=torch.channels_last_3d)
+                else:
+                    self.memory = memory.contiguous()
                 if self.memory_device == "cpu" and self.memory is not None:
                     self.memory = self.memory.to("cpu")
 
