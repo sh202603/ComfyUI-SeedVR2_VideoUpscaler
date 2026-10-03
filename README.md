@@ -6,7 +6,7 @@ Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for Comf
 
 Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#-run-as-standalone-cli) section.
 
-> **⚡ About this branch**: [`inference-acceleration`](https://github.com/sh202603/ComfyUI-SeedVR2_VideoUpscaler/tree/inference-acceleration) is a fork of [numz/ComfyUI-SeedVR2_VideoUpscaler](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) v2.5.24 that adds three inference acceleration options: BF16 DiT weights (on by default), FP8 GEMM for the DiT and a fused VAE path. With all three and torch.compile, a 512x512 batch of 13 frames takes 0.90 s instead of 2.10 s on an RTX 5080. See [⚡ Inference Acceleration](#-inference-acceleration). The rest of this README describes the upstream project, and its links point there.
+> **⚡ About this branch**: [`modi`](https://github.com/sh202603/ComfyUI-SeedVR2_VideoUpscaler/tree/modi) is a fork of [numz/ComfyUI-SeedVR2_VideoUpscaler](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) v2.5.24 that adds three inference acceleration options: BF16 DiT weights (on by default), FP8 GEMM for the DiT and a fused VAE path. With all three and torch.compile, a 512x512 batch of 13 frames takes 0.90 s instead of 2.10 s on an RTX 5080. See [⚡ Inference Acceleration](#-inference-acceleration). The rest of this README describes the upstream project, and its links point there.
 
 [![SeedVR2 v2.5 Deep Dive Tutorial](https://img.youtube.com/vi/MBtWYXq_r60/maxresdefault.jpg)](https://youtu.be/MBtWYXq_r60)
 
@@ -349,7 +349,7 @@ Three options shorten the VAE encoding, DiT upscaling and VAE decoding on NVIDIA
 ### Getting This Branch
 
 ```bash
-git clone -b inference-acceleration https://github.com/sh202603/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler
+git clone -b modi https://github.com/sh202603/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler
 ```
 
 Then install the requirements as described in [📦 Installation](#-installation) (ComfyUI) or [🖥️ Run as Standalone](#️-run-as-standalone-cli) (CLI). `requirements.txt` adds `comfy-kitchen>=0.2.36`.
