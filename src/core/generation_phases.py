@@ -316,7 +316,7 @@ def encode_all_batches(
             ctx['cache_context']['vae_newly_cached'] = True
             
             # If both models now cached, cache runner template
-            dit_is_cached = ctx['cache_context']['cached_dit'] or ctx['cache_context']['dit_newly_cached']
+            dit_is_cached = ctx['cache_context']['cached_dit'] is not None or ctx['cache_context']['dit_newly_cached']
             if dit_is_cached:
                 ctx['cache_context']['global_cache'].set_runner(
                     ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
@@ -617,7 +617,8 @@ def upscale_all_batches(
     
     try:
         # Materialize DiT if still on meta device
-        if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
+        # Compare with None: bool() of a torch.compile'd module calls __len__ and raises
+        if runner.dit is not None and next(runner.dit.parameters()).device.type == 'meta':
             materialize_model(runner, "dit", ctx['dit_device'], runner.config, debug)
         else:
             # Model already materialized (cached) - apply any pending configs if needed
@@ -629,7 +630,7 @@ def upscale_all_batches(
         ensure_precision_initialized(ctx, runner, debug)
 
         # Cache DiT now that it's fully configured and ready for inference
-        if ctx['cache_context']['dit_cache'] and not ctx['cache_context']['cached_dit']:
+        if ctx['cache_context']['dit_cache'] and ctx['cache_context']['cached_dit'] is None:
             runner.dit._model_name = ctx['cache_context']['dit_model']
             ctx['cache_context']['global_cache'].set_dit(
                 {'node_id': ctx['cache_context']['dit_id'], 'cache_model': True}, 
