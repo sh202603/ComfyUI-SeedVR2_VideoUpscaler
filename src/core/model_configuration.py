@@ -1391,7 +1391,7 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
         if getattr(runner, '_dit_fp8_gemm', False):
             actual_model = model.dit_model if hasattr(model, 'dit_model') else model
             if not getattr(actual_model, '_fp8_gemm_applied', False):
-                converted = convert_dit_to_fp8_gemm(actual_model, debug)
+                converted = convert_dit_to_fp8_gemm(actual_model, torch.device(runner._dit_device), debug)
                 actual_model._fp8_gemm_applied = True
                 debug.log(f"DiT FP8 GEMM enabled: {converted} linear layers converted", category="dit", force=True)
         

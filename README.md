@@ -410,8 +410,7 @@ Other sizes, `--no-bf16_dit` against `--fp8_dit --fused_vae --compile_dit`:
 - With `--no-bf16_dit` and neither opt-in option the output is bit-identical to upstream
 - These options rewrite the weights at load time, so changing one reloads a cached model instead of reconfiguring it
 - torch.compile is not applied to the VAE together with `fused_vae` (the combination was slower and used more VRAM); `--compile_dit` is unaffected
-- BlockSwap can be combined with `fp8_dit` (checked on a single image with the 3B model)
-- With `fp8_dit`, the output for a given seed differs slightly depending on whether a DiT offload device is set: the weights are then quantized on the CPU, where the per-tensor scale can round differently in its last bit. Both variants are equally close to the standard path
+- BlockSwap and a DiT offload device can be combined with `fp8_dit` without changing the output (checked with the 3B model)
 - ComfyUI pins its own comfy-kitchen version. If the installed version is older than 0.2.36, or its kernels fail the check that runs when the option is enabled, `fused_vae` falls back to the standard path
 
 ### Not Yet Tested

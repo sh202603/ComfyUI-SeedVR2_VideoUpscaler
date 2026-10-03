@@ -10,7 +10,8 @@ in FP8, which is ~2.5x faster on GPUs where BF16 with FP32 accumulation is half 
 
 Key Features:
 - Weights: quantized once with a per-tensor scale when the model is materialized
-  (FP8 E4M3 checkpoints are used as stored, with scale 1)
+  (FP8 E4M3 checkpoints are used as stored, with scale 1). The quantization runs on
+  the inference device even if the model is materialized on the offload device
 - Activations: dynamic per-tensor scale (abs-max) on every call, computed on the GPU
   by two Triton kernels (abs-max reduction, then scale + saturate + cast; no host sync)
 - GEMM: torch._scaled_mm with BF16 output; the bias is added outside the GEMM
@@ -165,7 +166,7 @@ class FP8Linear(nn.Module):
     a slower kernel than the bias-free one.
     """
 
-    def __init__(self, linear: nn.Linear):
+    def __init__(self, linear: nn.Linear, device: Optional[torch.device] = None):
         super().__init__()
         weight = linear.weight.detach()
         self.in_features, self.out_features = linear.in_features, linear.out_features
@@ -174,9 +175,14 @@ class FP8Linear(nn.Module):
             qweight = weight
             w_scale = torch.ones((), dtype=torch.float32, device=weight.device)
         else:
-            weight = weight.float()
+            # Quantize on the inference device and move the result back to where the
+            # model sits: CPU and CUDA can round the scale differently in its last bit,
+            # so quantizing on the offload device would change the output
+            source_device = weight.device
+            weight = weight.to(device if device is not None else source_device).float()
             w_scale = (weight.abs().amax() / FP8_MAX).clamp(min=1e-12)
-            qweight = (weight / w_scale).clamp(-FP8_MAX, FP8_MAX).to(FP8)
+            qweight = (weight / w_scale).clamp(-FP8_MAX, FP8_MAX).to(FP8).to(source_device)
+            w_scale = w_scale.to(source_device)
         # Stored as integer views: Module.to(dtype=...) casts every floating point
         # buffer (float8 included) and would destroy the FP8 codes / fp32 scale
         self.register_buffer("qweight", qweight.contiguous().view(torch.uint8))
@@ -206,11 +212,11 @@ class FP8SwiGLUMLP(nn.Module):
     folded into the quantization of proj_out's input.
     """
 
-    def __init__(self, mlp: nn.Module):
+    def __init__(self, mlp: nn.Module, device: Optional[torch.device] = None):
         super().__init__()
-        self.proj_in_gate = FP8Linear(mlp.proj_in_gate)
-        self.proj_out = FP8Linear(mlp.proj_out)
-        self.proj_in = FP8Linear(mlp.proj_in)
+        self.proj_in_gate = FP8Linear(mlp.proj_in_gate, device)
+        self.proj_out = FP8Linear(mlp.proj_out, device)
+        self.proj_in = FP8Linear(mlp.proj_in, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x8, x_scale = quantize_fp8(_flatten_tokens(x))
@@ -233,10 +239,10 @@ class FP8GELUMLP(nn.Module):
     proj_in's bias and the GELU are folded into the quantization of proj_out's input.
     """
 
-    def __init__(self, mlp: nn.Module):
+    def __init__(self, mlp: nn.Module, device: Optional[torch.device] = None):
         super().__init__()
-        self.proj_in = FP8Linear(mlp.proj_in)
-        self.proj_out = FP8Linear(mlp.proj_out)
+        self.proj_in = FP8Linear(mlp.proj_in, device)
+        self.proj_out = FP8Linear(mlp.proj_out, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.proj_in.gemm(*quantize_fp8(_flatten_tokens(x)))
@@ -256,36 +262,37 @@ def _is_convertible_linear(module: Optional[nn.Module]) -> bool:
     )
 
 
-def _convert_module(module: nn.Module) -> Tuple[Optional[nn.Module], int]:
+def _convert_module(module: nn.Module, device: Optional[torch.device]) -> Tuple[Optional[nn.Module], int]:
     """Build the FP8 replacement for a module, or (None, 0) if it is not a conversion target."""
     name = type(module).__name__
     if name == 'SwiGLUMLP' and all(
         _is_convertible_linear(getattr(module, attr, None)) for attr in ('proj_in_gate', 'proj_in', 'proj_out')
     ):
-        return FP8SwiGLUMLP(module), 3
+        return FP8SwiGLUMLP(module, device), 3
     if name == 'MLP' and getattr(getattr(module, 'act', None), 'approximate', None) == 'tanh' and all(
         _is_convertible_linear(getattr(module, attr, None)) for attr in ('proj_in', 'proj_out')
     ):
-        return FP8GELUMLP(module), 2
+        return FP8GELUMLP(module, device), 2
     if _is_convertible_linear(module):
-        return FP8Linear(module), 1
+        return FP8Linear(module, device), 1
     return None, 0
 
 
-def _convert_children(module: nn.Module) -> int:
+def _convert_children(module: nn.Module, device: Optional[torch.device]) -> int:
     converted = 0
     for name, child in list(module.named_children()):
-        replacement, count = _convert_module(child)
+        replacement, count = _convert_module(child, device)
         if replacement is not None:
             # The original module (and its weight) is freed as soon as its FP8 copy exists
             setattr(module, name, replacement)
             converted += count
         else:
-            converted += _convert_children(child)
+            converted += _convert_children(child, device)
     return converted
 
 
-def convert_dit_to_fp8_gemm(dit_model: nn.Module, debug: Optional['Debug'] = None) -> int:
+def convert_dit_to_fp8_gemm(dit_model: nn.Module, device: Optional[torch.device] = None,
+                            debug: Optional['Debug'] = None) -> int:
     """
     Swap the linear layers of the DiT transformer blocks for FP8 GEMM versions.
 
@@ -294,6 +301,8 @@ def convert_dit_to_fp8_gemm(dit_model: nn.Module, debug: Optional['Debug'] = Non
 
     Args:
         dit_model: Materialized DiT model (unwrapped NaDiT with a `blocks` ModuleList)
+        device: Device to quantize the weights on (the DiT inference device). The model
+                itself stays on its current device. None quantizes where the weights are
         debug: Debug instance for logging
 
     Returns:
@@ -306,7 +315,7 @@ def convert_dit_to_fp8_gemm(dit_model: nn.Module, debug: Optional['Debug'] = Non
     if debug:
         debug.start_timer("fp8_gemm_convert")
     with torch.no_grad():
-        converted = _convert_children(blocks)
+        converted = _convert_children(blocks, device)
     if debug:
         debug.end_timer("fp8_gemm_convert", f"FP8 GEMM conversion ({converted} linear layers)")
 
