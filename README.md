@@ -544,7 +544,8 @@ Configure the VAE (Variational Autoencoder) model for encoding/decoding video fr
 - **decode_tile_overlap**: Decoding tile overlap in pixels (default: 128)
 
 - **fused_vae**: Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels (default: off)
-  - Faster encoding and decoding; the VAE runs in FP16 instead of BF16
+  - Faster encoding and decoding with a lower VRAM peak; the VAE runs in FP16 instead of BF16
+  - torch.compile is not applied to the VAE together with it
   - Requires an NVIDIA CUDA GPU (uses the comfy-kitchen kernels). Not available for GGUF models
   - Falls back to the standard path if unsupported. Changing this setting reloads the model
 
@@ -949,7 +950,7 @@ python inference_cli.py media_folder/ \
 - `--attention_mode`: Attention backend: 'sdpa' (default), 'flash_attn_2' (Ampere+), 'flash_attn_3' (Hopper+), 'sageattn_2', or 'sageattn_3' (Blackwell)
 - `--bf16_dit` / `--no-bf16_dit`: Convert FP16 DiT weights to BF16 at load time: removes per-call weight casts and autocast (same VRAM, no quantization). CUDA only; FP8 and GGUF models are left as loaded (default: enabled)
 - `--fp8_dit`: Run the DiT block linear layers as FP8 GEMM (faster, lower VRAM, small quality change). Requires CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton; not for GGUF models. Best combined with `--compile_dit`
-- `--fused_vae`: Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels (faster encode/decode, VAE runs in FP16). Requires an NVIDIA CUDA GPU
+- `--fused_vae`: Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels (faster encode/decode with a lower VRAM peak, VAE runs in FP16). Requires an NVIDIA CUDA GPU. `--compile_vae` is not applied together with it
 - `--compile_dit`: Enable torch.compile for DiT model (20-40% speedup, requires PyTorch 2.0+ and Triton)
 - `--compile_vae`: Enable torch.compile for VAE model (15-25% speedup, requires PyTorch 2.0+ and Triton)
 - `--compile_backend`: Compilation backend: 'inductor' (full optimization) or 'cudagraphs' (lightweight) (default: inductor)

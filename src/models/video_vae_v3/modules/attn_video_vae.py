@@ -52,7 +52,7 @@ from .types import (
     _receptive_field_t,
 )
 from ....optimization.memory_manager import retry_on_oom
-from ....optimization.vae_fusion import fused_group_norm_silu, is_fusable_norm_silu
+from ....optimization.vae_fusion import fp16_accum_conv3d, is_fusable_conv, is_fusable_norm_silu
 
 logger = get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -118,6 +118,9 @@ class Upsample3D(Upsample2D):
     ) -> torch.FloatTensor:
         assert hidden_states.shape[1] == self.channels
 
+        if self.fused_path and self._is_fusable(hidden_states):
+            return self._fused_forward(hidden_states, memory_state)
+
         if hasattr(self, "norm") and self.norm is not None:
             # [Overridden] change to causal norm.
             hidden_states = causal_norm_wrapper(self.norm, hidden_states)
@@ -136,15 +139,6 @@ class Upsample3D(Upsample2D):
         for i in range(len(hidden_states)):
             def upscale_and_rearrange():
                 temp = self.upscale_conv(hidden_states[i])
-                if self.fused_path and temp.is_contiguous(memory_format=torch.channels_last_3d):
-                    # Fused VAE path: same pixel shuffle, written out in NDHWC for the following conv
-                    return rearrange(
-                        temp,
-                        "b (x y z c) f h w -> b (f z) (h x) (w y) c",
-                        x=self.spatial_ratio,
-                        y=self.spatial_ratio,
-                        z=self.temporal_ratio,
-                    ).permute(0, 4, 1, 2, 3)
                 return rearrange(
                     temp,
                     "b (x y z c) f h w -> b c (f z) (h x) (w y)",
@@ -183,6 +177,59 @@ class Upsample3D(Upsample2D):
             return hidden_states
         else:
             return torch.cat(hidden_states, dim=2)
+
+    def _is_fusable(self, hidden_states: torch.Tensor) -> bool:
+        """Whether the whole upsampler can run through the fused VAE path."""
+        conv = self.conv if self.name == "conv" else self.Conv2d_0
+        return (
+            getattr(self, "norm", None) is None
+            and self.use_conv
+            and not self.use_conv_transpose
+            and not self.slicing
+            and self.temporal_ratio in (1, 2)
+            and self.upscale_conv.weight.dtype == torch.float16
+            and is_fusable_conv(self.upscale_conv)
+            and conv.fused_path
+            and conv.supports_padded_buffer(hidden_states)
+        )
+
+    def _fused_forward(self, hidden_states: torch.Tensor, memory_state: MemoryState) -> torch.Tensor:
+        """
+        Fused VAE path: the pixel shuffle writes straight into the padded buffer of the
+        convolution that follows, so the shuffled tensor is never materialized.
+        """
+        conv = self.conv if self.name == "conv" else self.Conv2d_0
+        _, _, frames, height, width = hidden_states.shape
+
+        # [Overridden] For causal temporal conv: the duplicated first frame is not written
+        drop_head = self.temporal_up and memory_state != MemoryState.ACTIVE
+        shape = (
+            self.channels,
+            frames * self.temporal_ratio - (1 if drop_head else 0),
+            height * self.spatial_ratio,
+            width * self.spatial_ratio,
+        )
+
+        def write_frames(output: torch.Tensor) -> None:
+            temp = fp16_accum_conv3d(
+                hidden_states, self.upscale_conv.weight, self.upscale_conv.bias, (1, 1, 1), (0, 0, 0)
+            )
+            # "b (x y z c) f h w -> b c (f z) (h x) (w y)" with the merged axes kept apart
+            source = temp.reshape(
+                1, self.spatial_ratio, self.spatial_ratio, self.temporal_ratio, self.channels, frames, height, width
+            ).permute(0, 4, 5, 3, 6, 1, 7, 2)
+            split = (height, self.spatial_ratio, width, self.spatial_ratio)
+            if drop_head:
+                # remove_head: keep the first output frame, skip the second
+                output[:, :, :1].view(1, self.channels, 1, 1, *split).copy_(source[:, :, :1, :1])
+                if frames > 1:
+                    output[:, :, 1:].view(1, self.channels, frames - 1, self.temporal_ratio, *split).copy_(source[:, :, 1:])
+            else:
+                output.view(1, self.channels, frames, self.temporal_ratio, *split).copy_(source)
+
+        return conv.padded_buffer_conv(
+            shape, hidden_states, write_frames, frames_padded=False, memory_state=memory_state
+        )
 
 
 class Downsample3D(Downsample2D):
@@ -324,18 +371,18 @@ class ResnetBlock3D(ResnetBlock2D):
     def forward(
         self, input_tensor, temb, memory_state: MemoryState = MemoryState.DISABLED, **kwargs
     ):
+        if self.fused_path and temb is None and self._is_fusable(input_tensor):
+            return self._fused_forward(input_tensor, memory_state)
+
         hidden_states = input_tensor
 
-        if self.fused_path and is_fusable_norm_silu(self.norm1, self.nonlinearity, hidden_states):
-            hidden_states = fused_group_norm_silu(self.norm1, hidden_states)
-        else:
-            hidden_states = causal_norm_wrapper(self.norm1, hidden_states)
-            hidden_states = retry_on_oom(
-                self.nonlinearity,
-                hidden_states,
-                debug=getattr(self, 'debug', None),
-                operation_name="ResnetBlock3D.nonlinearity"
-            )
+        hidden_states = causal_norm_wrapper(self.norm1, hidden_states)
+        hidden_states = retry_on_oom(
+            self.nonlinearity,
+            hidden_states,
+            debug=getattr(self, 'debug', None),
+            operation_name="ResnetBlock3D.nonlinearity"
+        )
 
         if self.upsample is not None:
             # upsample_nearest_nhwc fails with large batch sizes.
@@ -359,16 +406,13 @@ class ResnetBlock3D(ResnetBlock2D):
         if temb is not None and self.time_embedding_norm == "default":
             hidden_states = hidden_states + temb
 
-        if self.fused_path and temb is None and is_fusable_norm_silu(self.norm2, self.nonlinearity, hidden_states):
-            hidden_states = fused_group_norm_silu(self.norm2, hidden_states)
-        else:
-            hidden_states = causal_norm_wrapper(self.norm2, hidden_states)
+        hidden_states = causal_norm_wrapper(self.norm2, hidden_states)
 
-            if temb is not None and self.time_embedding_norm == "scale_shift":
-                scale, shift = torch.chunk(temb, 2, dim=1)
-                hidden_states = hidden_states * (1 + scale) + shift
+        if temb is not None and self.time_embedding_norm == "scale_shift":
+            scale, shift = torch.chunk(temb, 2, dim=1)
+            hidden_states = hidden_states * (1 + scale) + shift
 
-            hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
 
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states, memory_state=memory_state)
@@ -379,6 +423,32 @@ class ResnetBlock3D(ResnetBlock2D):
         output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
 
         return output_tensor
+
+    def _is_fusable(self, input_tensor: torch.Tensor) -> bool:
+        """Whether the whole block can run through the fused VAE path."""
+        return (
+            self.upsample is None
+            and self.downsample is None
+            and self.time_emb_proj is None
+            and self.output_scale_factor == 1.0
+            and not self.training
+            and is_fusable_norm_silu(self.norm1, self.nonlinearity, input_tensor)
+            and is_fusable_norm_silu(self.norm2, self.nonlinearity, input_tensor)
+        )
+
+    def _fused_forward(self, input_tensor: torch.Tensor, memory_state: MemoryState) -> torch.Tensor:
+        """
+        Fused VAE path: each GroupNorm + SiLU writes straight into the padded buffer of the
+        convolution that follows, and conv2 adds the shortcut in its epilogue.
+        """
+        hidden_states = self.conv1.fused_norm_conv(self.norm1, input_tensor, memory_state=memory_state)
+
+        if self.conv_shortcut is not None:
+            input_tensor = self.conv_shortcut(input_tensor, memory_state=memory_state)
+
+        return self.conv2.fused_norm_conv(
+            self.norm2, hidden_states, memory_state=memory_state, residual=input_tensor
+        )
 
 
 class DownEncoderBlock3D(DownEncoderBlock2D):
@@ -871,11 +941,11 @@ class Encoder3D(nn.Module):
 
         # post-process
         if self.fused_path and is_fusable_norm_silu(self.conv_norm_out, self.conv_act, sample):
-            sample = fused_group_norm_silu(self.conv_norm_out, sample)
+            sample = self.conv_out.fused_norm_conv(self.conv_norm_out, sample, memory_state=memory_state)
         else:
             sample = causal_norm_wrapper(self.conv_norm_out, sample)
             sample = self.conv_act(sample)
-        sample = self.conv_out(sample, memory_state=memory_state)
+            sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
 
@@ -1055,11 +1125,11 @@ class Decoder3D(nn.Module):
 
         # post-process
         if self.fused_path and is_fusable_norm_silu(self.conv_norm_out, self.conv_act, sample):
-            sample = fused_group_norm_silu(self.conv_norm_out, sample)
+            sample = self.conv_out.fused_norm_conv(self.conv_norm_out, sample, memory_state=memory_state)
         else:
             sample = causal_norm_wrapper(self.conv_norm_out, sample)
             sample = self.conv_act(sample)
-        sample = self.conv_out(sample, memory_state=memory_state)
+            sample = self.conv_out(sample, memory_state=memory_state)
 
         return sample
 

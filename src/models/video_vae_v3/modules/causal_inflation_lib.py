@@ -28,7 +28,7 @@ from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
 from ....optimization.memory_manager import retry_on_oom
 from ....optimization.compatibility import NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
-from ....optimization.vae_fusion import fp16_accum_conv3d, match_channels_last_3d
+from ....optimization.vae_fusion import fp16_accum_conv3d, fused_group_norm_silu
 
 # Single GPU inference - no distributed processing needed
 #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")
@@ -267,10 +267,6 @@ class InflatedCausalConv3d(Conv3d):
         cache = cache_send_recv(
             input, cache_size=cache_size, memory=self.memory, times=self.temporal_padding * 2
         )
-        # Fused VAE path: keep the carried-over frames in NDHWC like the input,
-        # so that concatenating them does not fall back to NCDHW
-        if self.fused_path and cache is not None:
-            cache = match_channels_last_3d(cache, input[0])
 
         # Single GPU inference - simplified memory management
         if (
@@ -309,16 +305,212 @@ class InflatedCausalConv3d(Conv3d):
                 next_cache = input[i][:, :, -cache_size:]
 
             # Conv forward for this input slice.
-            input[i] = self.memory_limit_conv(
-                input[i],
-                padding=padding,
-                prev_cache=cache
-            )
+            if self.fused_path and input[i].dtype == torch.float16 and self.weight.dtype == torch.float16:
+                # Fused VAE path: the fp16-accumulate kernel needs no workspace,
+                # so the input is not split by the memory limit
+                input[i] = retry_on_oom(
+                    self._fused_conv,
+                    input[i],
+                    cache,
+                    debug=getattr(self, 'debug', None),
+                    operation_name="InflatedCausalConv3d.fused_conv"
+                )
+            else:
+                input[i] = self.memory_limit_conv(
+                    input[i],
+                    padding=padding,
+                    prev_cache=cache
+                )
 
             # Update cache.
             cache = next_cache
 
         return input[0] if squeeze_out else input
+
+    def _zero_spatial_border(self, buffer: Tensor, height: int, width: int) -> None:
+        """Zero the spatial padding of a buffer whose interior is height x width."""
+        _, pad_h, pad_w = self.padding
+        if pad_h > 0:
+            buffer[:, :, :, :pad_h].zero_()
+            buffer[:, :, :, pad_h + height:].zero_()
+        if pad_w > 0:
+            buffer[:, :, :, pad_h:pad_h + height, :pad_w].zero_()
+            buffer[:, :, :, pad_h:pad_h + height, pad_w + width:].zero_()
+
+    def _fused_conv(self, x: Tensor, cache: Optional[Tensor]) -> Tensor:
+        """
+        Fused VAE path: convolve [cache, x] with the fp16-accumulate kernel.
+
+        The carried-over frames and the zero spatial padding are written into one NDHWC
+        buffer (a single copy of x), instead of a concatenation followed by a padding copy.
+        """
+        _, pad_h, pad_w = self.padding
+        num_cache = 0 if cache is None else cache.size(2)
+        if num_cache == 0 and pad_h == 0 and pad_w == 0:
+            return fp16_accum_conv3d(x, self.weight, self.bias, self.stride, (0, 0, 0))
+
+        batch, channels, frames, height, width = x.shape
+        buffer = torch.empty(
+            (batch, channels, num_cache + frames, height + 2 * pad_h, width + 2 * pad_w),
+            dtype=x.dtype, device=x.device, memory_format=torch.channels_last_3d
+        )
+        self._zero_spatial_border(buffer, height, width)
+        if num_cache > 0:
+            buffer[:, :, :num_cache, pad_h:pad_h + height, pad_w:pad_w + width] = cache
+        buffer[:, :, num_cache:, pad_h:pad_h + height, pad_w:pad_w + width] = x
+        return fp16_accum_conv3d(buffer, self.weight, self.bias, self.stride, (0, 0, 0))
+
+    def fused_norm_conv(
+        self,
+        norm_layer: nn.GroupNorm,
+        x: Tensor,
+        memory_state: MemoryState = MemoryState.UNSET,
+        residual: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Fused VAE path: GroupNorm + SiLU, then this convolution, plus an optional residual.
+        The caller checks is_fusable_norm_silu. Same result as forward() on the normalized
+        and activated input (up to the rounding of a residual added in the kernel).
+
+        Where possible, GroupNorm + SiLU writes straight into the padded buffer the
+        convolution reads (see padded_buffer_conv), and the fp16-accumulate kernel adds
+        the residual in its epilogue.
+
+        Args:
+            norm_layer: GroupNorm applied per frame in front of this convolution
+            x: [B, C, T, H, W] fp16 input of norm_layer
+            memory_state: Causal memory state, as in forward()
+            residual: Optional tensor of the output shape to add to the output
+
+        Returns:
+            Convolution output (with the residual added)
+        """
+        if self.supports_padded_buffer(x):
+            def write_frames(frames: Tensor) -> None:
+                fused_group_norm_silu(norm_layer, x, pad=self.padding[1:], out=frames)
+
+            return self.padded_buffer_conv(
+                x.shape[1:], x, write_frames, frames_padded=True,
+                memory_state=memory_state, residual=residual
+            )
+
+        output = self(fused_group_norm_silu(norm_layer, x), memory_state=memory_state)
+        return output if residual is None else residual + output
+
+    def supports_padded_buffer(self, x: Tensor) -> bool:
+        """Whether padded_buffer_conv can run this convolution for an input like x."""
+        if not (
+            x.size(0) == 1
+            and x.dtype == torch.float16
+            and self.weight.dtype == torch.float16
+            and tuple(self.stride) == (1, 1, 1)
+            and tuple(self.dilation) == (1, 1, 1)
+            and self.padding_mode == "zeros"
+        ):
+            return False
+        if self.fused_path:
+            return True
+        # cuDNN convolution: keep within the memory limit the standard path enforces by splitting
+        _, channels, frames, height, width = x.shape
+        frames += self.kernel_size[0] - 1
+        size = channels * frames * (height + 2 * self.padding[1]) * (width + 2 * self.padding[2])
+        return size * x.element_size() / 1024**3 < self.memory_limit
+
+    def padded_buffer_conv(
+        self,
+        shape,
+        like: Tensor,
+        write_frames,
+        frames_padded: bool,
+        memory_state: MemoryState = MemoryState.UNSET,
+        residual: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Fused VAE path: run the convolution on a buffer its input is written into in place.
+
+        The NDHWC buffer already holds the zero spatial padding and leaves room in front for
+        the frames carried over from the previous temporal slice, so the input needs no
+        concatenation or padding copy. Same result and causal memory as forward() on the
+        frames that write_frames produces. Requires supports_padded_buffer().
+
+        Args:
+            shape: (C, T, H, W) of the convolution input, without padding
+            like: Tensor giving the dtype and device of the buffer
+            write_frames: Callable that writes the input frames into the tensor it is given.
+                          It may run again after an OOM, so it must not depend on its own effects
+            frames_padded: True if write_frames writes [1, C, T, H + 2 * pad, W + 2 * pad] frames
+                           including their zero padding, False if it writes [1, C, T, H, W]
+            memory_state: Causal memory state, as in forward()
+            residual: Optional tensor of the output shape to add to the output
+
+        Returns:
+            Convolution output (with the residual added)
+        """
+        assert memory_state != MemoryState.UNSET
+        if memory_state != MemoryState.ACTIVE:
+            self.memory = None
+        return retry_on_oom(
+            self._padded_buffer_conv,
+            shape,
+            like,
+            write_frames,
+            frames_padded,
+            memory_state,
+            residual,
+            debug=getattr(self, 'debug', None),
+            operation_name="InflatedCausalConv3d.padded_buffer_conv"
+        )
+
+    def _padded_buffer_conv(self, shape, like, write_frames, frames_padded, memory_state, residual) -> Tensor:
+        channels, frames, height, width = shape
+        _, pad_h, pad_w = self.padding
+
+        # Frames in front of the input: carried over from the previous slice, or the first frame repeated
+        memory = self.memory
+        num_cache = memory.size(2) if memory is not None else self.temporal_padding * 2
+        buffer = torch.empty(
+            (1, channels, num_cache + frames, height + 2 * pad_h, width + 2 * pad_w),
+            dtype=like.dtype, device=like.device, memory_format=torch.channels_last_3d
+        )
+        new_frames = buffer[:, :, num_cache:]
+        if frames_padded:
+            write_frames(new_frames)
+        else:
+            self._zero_spatial_border(new_frames, height, width)
+            write_frames(new_frames[:, :, :, pad_h:pad_h + height, pad_w:pad_w + width])
+        if num_cache > 0:
+            if memory is not None:
+                self._zero_spatial_border(buffer[:, :, :num_cache], height, width)
+                buffer[:, :, :num_cache, pad_h:pad_h + height, pad_w:pad_w + width] = memory
+            else:
+                buffer[:, :, :num_cache] = new_frames[:, :, :1]
+
+        # Frames to carry over to the next slice (as slicing_forward keeps them: without padding).
+        # Assigned after the convolution so that an OOM retry starts from the same state
+        new_memory = None
+        cache_size = self.kernel_size[0] - self.stride[0]
+        if (
+            memory_state in [MemoryState.INITIALIZING, MemoryState.ACTIVE]
+            and not self.training
+            and (self.memory_device is not None)
+            and cache_size != 0
+        ):
+            new_memory = buffer[:, :, -cache_size:, pad_h:pad_h + height, pad_w:pad_w + width]
+            new_memory = new_memory.detach().clone(memory_format=torch.channels_last_3d)
+            if self.memory_device == "cpu":
+                new_memory = new_memory.to("cpu")
+
+        if self.fused_path:
+            output = fp16_accum_conv3d(buffer, self.weight, self.bias, self.stride, (0, 0, 0), residual=residual)
+        else:
+            with ignore_padding(self):
+                output = self._conv_forward(buffer, self.weight, self.bias)
+            if residual is not None:
+                output = residual + output
+
+        if new_memory is not None:
+            self.memory = new_memory
+        return output
 
     def tflops(self, args, kwargs, output) -> float:
         if torch.is_tensor(output):

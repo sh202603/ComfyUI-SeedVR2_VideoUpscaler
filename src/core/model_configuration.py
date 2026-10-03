@@ -1466,7 +1466,7 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             model.set_memory_limit(**config.vae.memory_limit)
             debug.end_timer("vae_set_memory_limit", "VAE memory limits configured")
 
-        # Switch to the fused path before torch.compile (only once)
+        # Switch to the fused path (only once)
         if getattr(runner, '_vae_fused_path', False) and not getattr(model, 'fused_path', False):
             convs, norm_owners = enable_vae_fused_path(model)
             debug.log(f"VAE fused path enabled: {convs} convolutions with fp16 accumulation, "
@@ -1478,7 +1478,12 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             encoder_compiled = hasattr(model, 'encoder') and hasattr(model.encoder, '_orig_mod')
             decoder_compiled = hasattr(model, 'decoder') and hasattr(model.decoder, '_orig_mod')
             
-            if not (encoder_compiled and decoder_compiled):
+            if getattr(model, 'fused_path', False):
+                # The fused path already runs fused kernels that write into shared buffers;
+                # tracing it adds copies (measured slower and with a higher VRAM peak)
+                debug.log("torch.compile skipped for VAE: not used together with the fused path", 
+                         category="vae", force=True)
+            elif not (encoder_compiled and decoder_compiled):
                 model = _apply_vae_submodule_compile(model, runner._vae_compile_args, debug)
             else:
                 debug.log("Reusing existing torch.compile for VAE submodules", category="reuse")

@@ -8,6 +8,9 @@ changing its model definition, using comfy-kitchen kernels:
 - The tensors between them stay in NDHWC (channels_last_3d), including the frames
   a causal convolution carries over from the previous temporal slice and the
   pixel shuffle of the upsamplers
+- No intermediate copies in front of a convolution: GroupNorm + SiLU writes straight
+  into the zero-padded buffer the convolution reads (which also holds the carried-over
+  frames), and the residual of a ResNet block is added in the convolution's epilogue
 
 On GeForce GPUs the tensor core rate with fp32 accumulation is half of the fp16
 accumulation rate, so the convolution kernel itself is ~2x faster. It only pays off
@@ -15,7 +18,8 @@ when its input is already NDHWC, hence the fused GroupNorm + SiLU in front of it
 
 Requirements: NVIDIA CUDA device and comfy-kitchen with its CUDA backend. The kernels
 need fp16 inputs and weights, so the VAE runs in fp16 instead of the compute dtype.
-comfy-kitchen is optional: when it is missing the standard path runs unchanged.
+When comfy-kitchen is missing, lacks the kernels or fails the kernel probe (e.g. after
+an incompatible update), the standard path runs unchanged.
 """
 
 import torch
@@ -27,6 +31,9 @@ _REQUIRED_KERNELS = ("fp16_conv3d", "group_norm_silu_pad3d")
 
 # Lazily imported comfy_kitchen module (None until the fused path is requested)
 _kitchen = None
+
+# Kernel probe results per device (None = passed, otherwise the failure reason)
+_probe_results = {}
 
 
 def get_vae_fused_path_unsupported_reason(device: torch.device) -> Optional[str]:
@@ -65,10 +72,54 @@ def get_vae_fused_path_unsupported_reason(device: torch.device) -> Optional[str]
             return f"comfy-kitchen CUDA backend lacks {', '.join(missing)} (update comfy-kitchen)"
         _kitchen = comfy_kitchen
 
+    if device not in _probe_results:
+        _probe_results[device] = _probe_kernels(device)
+    return _probe_results[device]
+
+
+def _probe_kernels(device: torch.device) -> Optional[str]:
+    """
+    Run the kernels the way the fused path uses them on a tiny input and compare with torch.
+
+    Guards against comfy-kitchen versions whose kernels changed signature or semantics:
+    zero spatial padding written into a frame-offset view, and a residual added in the
+    convolution epilogue.
+
+    Returns:
+        None if the kernels behave as expected, otherwise a human-readable reason
+    """
+    try:
+        generator = torch.Generator().manual_seed(0)
+        x = torch.randn(1, 16, 2, 6, 6, generator=generator).to(device, torch.float16)
+        norm = nn.GroupNorm(4, 16).to(device, torch.float16)
+        conv_weight = (torch.randn(8, 16, 3, 3, 3, generator=generator) * 0.05).to(device, torch.float16)
+        conv_bias = (torch.randn(8, generator=generator) * 0.1).to(device, torch.float16)
+        residual = torch.randn(1, 8, 2, 6, 6, generator=generator).to(device, torch.float16)
+
+        # One carried-over frame slot in front, filled with the first frame
+        buffer = torch.empty((1, 16, 4, 8, 8), dtype=torch.float16, device=device,
+                             memory_format=torch.channels_last_3d)
+        fused_group_norm_silu(norm, x, pad=(1, 1), out=buffer[:, :, 2:])
+        buffer[:, :, :2] = buffer[:, :, 2:3]
+        output = fp16_accum_conv3d(buffer, conv_weight, conv_bias, (1, 1, 1), (0, 0, 0), residual=residual)
+
+        frames = x.float().transpose(1, 2).reshape(2, 16, 6, 6)
+        frames = F.silu(F.group_norm(frames, 4, norm.weight.float(), norm.bias.float(), norm.eps))
+        reference = F.pad(frames.reshape(1, 2, 16, 6, 6).transpose(1, 2), (1, 1, 1, 1))
+        reference = torch.cat([reference[:, :, :1], reference[:, :, :1], reference], dim=2)
+        reference = F.conv3d(reference, conv_weight.float(), conv_bias.float()) + residual.float()
+
+        if output.shape != reference.shape:
+            return f"comfy-kitchen kernel probe failed: output shape {tuple(output.shape)}"
+        error = (output.float() - reference).abs().max().item()
+        if not error <= 0.05 * reference.abs().max().item():
+            return f"comfy-kitchen kernel probe failed: output differs from torch (max error {error:.3f})"
+    except Exception as e:
+        return f"comfy-kitchen kernel probe failed: {e}"
     return None
 
 
-def _is_fusable_conv(conv: nn.Module) -> bool:
+def is_fusable_conv(conv: nn.Module) -> bool:
     """Shapes the fp16-accumulate kernel serves; other convolutions keep the standard path."""
     return (
         conv.groups == 1
@@ -86,6 +137,7 @@ def enable_vae_fused_path(vae: nn.Module) -> Tuple[int, int]:
     Sets the `fused_path` flag on the causal convolutions the kernel serves, on the
     modules that run GroupNorm + SiLU in front of them and on the upsamplers, and stores
     the convolution weights in NDHWC. The model definition and state dict keys are unchanged.
+    Modules check the remaining conditions per call and otherwise run their standard path.
 
     Args:
         vae: Materialized VAE with fp16 weights
@@ -101,7 +153,7 @@ def enable_vae_fused_path(vae: nn.Module) -> Tuple[int, int]:
     owners = 0
     for module in vae.modules():
         if isinstance(module, InflatedCausalConv3d):
-            if _is_fusable_conv(module):
+            if is_fusable_conv(module):
                 module.weight.data = module.weight.data.contiguous(memory_format=torch.channels_last_3d)
                 module.fused_path = True
                 convs += 1
@@ -109,7 +161,9 @@ def enable_vae_fused_path(vae: nn.Module) -> Tuple[int, int]:
             module.fused_path = True
             owners += 1
         elif isinstance(module, Upsample3D):
-            # Pixel shuffle written out in NDHWC for the convolution that follows
+            # Upscale convolution and pixel shuffle feed the padded buffer of the convolution that follows
+            upscale_conv = module.upscale_conv
+            upscale_conv.weight.data = upscale_conv.weight.data.contiguous(memory_format=torch.channels_last_3d)
             module.fused_path = True
     vae.fused_path = True
     return convs, owners
@@ -126,25 +180,31 @@ def is_fusable_norm_silu(norm_layer: nn.Module, act: nn.Module, x: torch.Tensor)
     )
 
 
-def fused_group_norm_silu(norm_layer: nn.GroupNorm, x: torch.Tensor) -> torch.Tensor:
+def fused_group_norm_silu(norm_layer: nn.GroupNorm, x: torch.Tensor, pad: Tuple[int, int] = (0, 0),
+                          out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Per-frame GroupNorm followed by SiLU in one pass.
+    Per-frame GroupNorm followed by SiLU in one pass, optionally zero-padded spatially.
 
     Args:
         norm_layer: GroupNorm applied per frame
         x: [B, C, T, H, W] fp16 tensor
+        pad: Zero padding (H, W) applied on both sides
+        out: Optional NDHWC tensor of the padded shape to write into. For a batch of one
+             it may be a temporal slice of a longer buffer
 
     Returns:
-        [B, C, T, H, W] fp16 tensor in NDHWC (channels_last_3d)
+        [B, C, T, H + 2 * pad[0], W + 2 * pad[1]] fp16 tensor in NDHWC (channels_last_3d);
+        `out` if given
     """
     return _kitchen.group_norm_silu_pad3d(
         x, norm_layer.weight, norm_layer.bias, norm_layer.num_groups, norm_layer.eps,
-        pad=(0, 0, 0, 0, 0), silu=True
+        pad=(pad[1], pad[1], pad[0], pad[0], 0), silu=True, zero_pad=True, out=out
     )
 
 
 def fp16_accum_conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
-                      stride: Tuple[int, int, int], padding: Tuple[int, int, int]) -> torch.Tensor:
+                      stride: Tuple[int, int, int], padding: Tuple[int, int, int],
+                      residual: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Zero-padded 3D convolution with fp16 accumulation.
 
@@ -154,18 +214,11 @@ def fp16_accum_conv3d(input: torch.Tensor, weight: torch.Tensor, bias: Optional[
         bias: fp16 bias or None
         stride: Convolution stride (T, H, W)
         padding: Zero padding (T, H, W) applied on both sides
+        residual: Optional fp16 tensor of the output shape, added in the kernel's epilogue
 
     Returns:
         fp16 convolution output in NDHWC (channels_last_3d)
     """
     if any(padding):
         input = F.pad(input, (padding[2], padding[2], padding[1], padding[1], padding[0], padding[0]))
-    return _kitchen.fp16_conv3d(input, weight, bias, stride=stride)
-
-
-def match_channels_last_3d(tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-    """Convert tensor to NDHWC if reference is NDHWC, so that concatenating them keeps NDHWC."""
-    cl = torch.channels_last_3d
-    if reference.is_contiguous(memory_format=cl) and not tensor.is_contiguous(memory_format=cl):
-        return tensor.contiguous(memory_format=cl)
-    return tensor
+    return _kitchen.fp16_conv3d(input, weight, bias, residual=residual, stride=stride)

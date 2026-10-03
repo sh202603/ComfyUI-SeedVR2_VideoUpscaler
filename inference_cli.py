@@ -1461,7 +1461,8 @@ Examples:
                              "Best combined with --compile_dit")
     perf_group.add_argument("--fused_vae", action="store_true",
                         help="Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels "
-                             "(faster encode/decode, VAE runs in FP16). Requires an NVIDIA CUDA GPU")
+                             "(faster encode/decode with a lower VRAM peak, VAE runs in FP16). Requires an NVIDIA CUDA GPU. "
+                             "--compile_vae is not applied together with it")
     perf_group.add_argument("--compile_dit", action="store_true", 
                         help="Enable torch.compile for DiT model (20-40%% speedup, requires PyTorch 2.0+ and Triton)")
     perf_group.add_argument("--compile_vae", action="store_true",

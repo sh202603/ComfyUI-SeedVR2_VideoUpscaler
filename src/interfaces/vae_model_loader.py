@@ -151,7 +151,8 @@ class SeedVR2LoadVAEModel(io.ComfyNode):
                     optional=True,
                     tooltip=(
                         "Run the VAE through fused GroupNorm+SiLU and fp16-accumulate convolution kernels.\n"
-                        "Faster encoding and decoding; the VAE runs in FP16 instead of BF16.\n"
+                        "Faster encoding and decoding with a lower VRAM peak; the VAE runs in FP16 instead of BF16.\n"
+                        "torch.compile is not applied to the VAE together with it.\n"
                         "\n"
                         "Requires an NVIDIA CUDA GPU (uses the comfy-kitchen kernels).\n"
                         "Not available for GGUF models. Falls back to the standard path if unsupported.\n"
