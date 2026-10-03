@@ -6,6 +6,8 @@ Official release of [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) for Comf
 
 Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#-run-as-standalone-cli) section.
 
+> **⚡ About this branch**: [`inference-acceleration`](https://github.com/sh202603/ComfyUI-SeedVR2_VideoUpscaler/tree/inference-acceleration) is a fork of [numz/ComfyUI-SeedVR2_VideoUpscaler](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) v2.5.24 that adds three inference acceleration options: BF16 DiT weights (on by default), FP8 GEMM for the DiT and a fused VAE path. With all three and torch.compile, a 512x512 batch of 13 frames takes 0.90 s instead of 2.10 s on an RTX 5080. See [⚡ Inference Acceleration](#-inference-acceleration). The rest of this README describes the upstream project, and its links point there.
+
 [![SeedVR2 v2.5 Deep Dive Tutorial](https://img.youtube.com/vi/MBtWYXq_r60/maxresdefault.jpg)](https://youtu.be/MBtWYXq_r60)
 
 ![Usage Example](docs/usage_01.png)
@@ -17,6 +19,7 @@ Can run as **Multi-GPU standalone CLI** too, see [🖥️ Run as Standalone](#-r
 - [🆙 Future Work](#-future-work)
 - [🚀 Release Notes](#-release-notes)
 - [🎯 Features](#-features)
+- [⚡ Inference Acceleration](#-inference-acceleration)
 - [🔧 Requirements](#-requirements)
 - [📦 Installation](#-installation)
 - [📖 Usage](#-usage)
@@ -317,6 +320,7 @@ We're actively working on improvements and new features. To stay informed:
 
 ### Performance Features
 - **torch.compile Integration**: Optional 20-40% DiT speedup and 15-25% VAE speedup with PyTorch 2.0+ compilation
+- **Inference Acceleration**: BF16 DiT weights, FP8 GEMM for the DiT and a fused VAE path on NVIDIA GPUs (see [⚡ Inference Acceleration](#-inference-acceleration))
 - **Multi-GPU CLI**: Distribute workload across multiple GPUs with automatic temporal overlap blending
 - **Model Caching**: Keep models loaded between generations for single-GPU directory processing or multi-GPU streaming
 - **Flexible Attention Backends**: Choose between PyTorch SDPA (stable, always available), Flash Attention 2/3, or SageAttention 2/3 for faster computation on supported hardware
@@ -331,6 +335,95 @@ We're actively working on improvements and new features. To stay informed:
 - **Standalone CLI**: Command-line interface for batch processing and automation
 - **Debug Logging**: Comprehensive debug mode with memory tracking, timing information, and processing details
 - **Progress Reporting**: Real-time progress updates during processing
+
+## ⚡ Inference Acceleration
+
+Three options shorten the VAE encoding, DiT upscaling and VAE decoding on NVIDIA GPUs. Each one falls back to the standard path when the GPU, the checkpoint or the installed packages can't run it.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `bf16_dit` | on | Converts FP16 DiT weights to BF16 when the model is loaded, which removes the per-call weight casts and autocast. No quantization, same VRAM |
+| `fp8_dit` | off | Runs the linear layers of the transformer blocks as FP8 matrix multiplications. The `*_fp8_e4m3fn` checkpoints only store their weights in FP8 and still multiply in BF16; this option makes the multiplication itself FP8 |
+| `fused_vae` | off | Runs the VAE in FP16 through fused GroupNorm+SiLU and fp16-accumulate convolution kernels, writing intermediate results straight into the padded convolution inputs instead of copying them |
+
+### Getting This Branch
+
+```bash
+git clone -b inference-acceleration https://github.com/sh202603/ComfyUI-SeedVR2_VideoUpscaler.git seedvr2_videoupscaler
+```
+
+Then install the requirements as described in [📦 Installation](#-installation) (ComfyUI) or [🖥️ Run as Standalone](#️-run-as-standalone-cli) (CLI). `requirements.txt` adds `comfy-kitchen>=0.2.36`.
+
+### Usage
+
+- **ComfyUI**: `bf16_dit` and `fp8_dit` are inputs of the [DiT loader node](#1-seedvr2-download-dit-model), `fused_vae` is an input of the [VAE loader node](#2-seedvr2-download-vae-model)
+- **CLI**: `--fp8_dit` and `--fused_vae` enable the opt-in options, `--no-bf16_dit` disables the BF16 conversion
+
+```bash
+python inference_cli.py video.mp4 \
+    --dit_model seedvr2_ema_3b_fp16.safetensors \
+    --resolution 720 \
+    --batch_size 33 \
+    --fp8_dit \
+    --fused_vae \
+    --compile_dit
+```
+
+### Measured Results
+
+Measured on an RTX 5080 16GB (Ubuntu, PyTorch 2.12.1 + CUDA 13.0, Triton 3.7.1, comfy-kitchen 0.2.37) with `seedvr2_ema_3b_fp16.safetensors` and `ema_vae_fp16.safetensors`, SDPA attention, no color correction. Times cover the VAE encode, DiT inference and VAE decode calls of one batch, each bracketed by a CUDA synchronize; model loading, device movement and post-processing are excluded. Each value is the best of 3 runs after warm-up (4 with torch.compile).
+
+512x512 output, one batch of 13 frames:
+
+| Configuration | Encode | DiT | Decode | Total | PSNR |
+| --- | --- | --- | --- | --- | --- |
+| `--no-bf16_dit` (same as upstream) | 488 ms | 451 ms | 1159 ms | 2097 ms | reference |
+| Default (`bf16_dit`) | 489 ms | 372 ms | 1158 ms | 2018 ms | 51.6 dB |
+| `--fp8_dit` | 486 ms | 263 ms | 1194 ms | 1944 ms | 41.9 dB |
+| `--no-bf16_dit --fused_vae` | 210 ms | 450 ms | 515 ms | 1175 ms | 51.6 dB |
+| `--fp8_dit --fused_vae` | 209 ms | 259 ms | 513 ms | 981 ms | 41.8 dB |
+| `--fp8_dit --fused_vae --compile_dit` | 211 ms | 169 ms | 516 ms | 896 ms | 42.0 dB |
+
+Other sizes, `--no-bf16_dit` against `--fp8_dit --fused_vae --compile_dit`:
+
+| Output | Before | After | Speedup | PSNR |
+| --- | --- | --- | --- | --- |
+| 256x256, 13 frames | 530 ms | 257 ms | 2.06x | 42.4 dB |
+| 512x512, 13 frames | 2097 ms | 896 ms | 2.34x | 42.0 dB |
+| 512x512, 49 frames | 7585 ms | 3278 ms | 2.31x | 44.3 dB |
+| 1280x720, 5 frames | 3968 ms | 1410 ms | 2.82x | 43.9 dB |
+
+- **PSNR** compares the output frames with those of the `--no-bf16_dit` run with the same seed. For scale, switching from the FP16 checkpoint to the upstream `seedvr2_ema_3b_fp8_e4m3fn.safetensors` checkpoint gives 40.0 dB on the same input
+- The difference depends on the input: on the `Sadhu_320x478.png` example image upscaled to 640px (LAB color correction, 8-bit output), the default measured 46.4 dB and `--fp8_dit` 35.7 dB
+- **1280x720**: the standard decode runs out of memory once per batch on the 16GB card at this size and retries; that retry is part of the "before" time. Peak allocated VRAM with both models kept on the GPU went from 10.1 GiB to 7.5 GiB
+- The speedup depends on the GPU: only the RTX 5080 has been measured
+
+### Requirements and Fallbacks
+
+| Option | Requirements |
+| --- | --- |
+| `bf16_dit` | NVIDIA CUDA GPU with BF16 support and an FP16 checkpoint. FP8 and GGUF checkpoints are loaded as before |
+| `fp8_dit` | NVIDIA GPU with CUDA compute capability 8.9+ (RTX 40 series or newer) and Triton. Not available for GGUF checkpoints |
+| `fused_vae` | NVIDIA CUDA GPU and `comfy-kitchen>=0.2.36` with its CUDA backend. Not available for GGUF checkpoints |
+
+- An opt-in option that can't run logs a warning and the standard path runs instead. A skipped `bf16_dit` is only reported in debug mode
+- With `--no-bf16_dit` and neither opt-in option the output is bit-identical to upstream
+- These options rewrite the weights at load time, so changing one reloads a cached model instead of reconfiguring it
+- torch.compile is not applied to the VAE together with `fused_vae` (the combination was slower and used more VRAM); `--compile_dit` is unaffected
+- BlockSwap can be combined with `fp8_dit` (checked on a single image with the 3B model)
+- With `fp8_dit`, the output for a given seed differs slightly depending on whether a DiT offload device is set: the weights are then quantized on the CPU, where the per-tensor scale can round differently in its last bit. Both variants are equally close to the standard path
+- ComfyUI pins its own comfy-kitchen version. If the installed version is older than 0.2.36, or its kernels fail the check that runs when the option is enabled, `fused_vae` falls back to the standard path
+
+### Not Yet Tested
+
+- 7B checkpoints with real weights (only the dtype handling was checked on a reduced model)
+- Windows, AMD ROCm and Apple Silicon (the options are skipped on non-NVIDIA backends)
+- Multi-GPU runs
+- Execution inside ComfyUI (the node inputs are wired, but only the CLI has been run)
+
+### Acknowledgements
+
+The FP8 quantization kernels follow [flashvsr-sm89-ops](https://github.com/aireet/flashvsr-sm89-ops) (Apache-2.0). The fused VAE path uses the `group_norm_silu_pad3d` and `fp16_conv3d` kernels of [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen).
 
 ## 🔧 Requirements
 
@@ -347,7 +440,8 @@ With the current optimizations (tiling, BlockSwap, GGUF quantization), SeedVR2 c
 - **ComfyUI**: Latest version recommended
 - **Python**: 3.12+ (Python 3.12 and 3.13 tested and recommended)
 - **PyTorch**: 2.0+ for torch.compile support (optional but recommended)
-- **Triton**: Required for torch.compile with inductor backend (optional)
+- **Triton**: Required for torch.compile with inductor backend and for `fp8_dit` (optional)
+- **comfy-kitchen**: 0.2.36+, provides the CUDA kernels of `fused_vae` (installed with the requirements; without it `fused_vae` falls back to the standard path)
 - **Flash Attention / SageAttention**: Flash Attention 2 (Ampere+), Flash Attention 3 (Hopper+), SageAttention 2 or SageAttention 3 (Blackwell) provide faster attention computation on supported hardware (optional, falls back to PyTorch SDPA)
 
 ## 📦 Installation
@@ -889,6 +983,15 @@ python inference_cli.py video.mp4 \
     --vae_encode_tiled \
     --vae_decode_tiled
 
+# Accelerated inference on an RTX 40 series or newer GPU (FP8 GEMM + fused VAE path + torch.compile)
+python inference_cli.py video.mp4 \
+    --dit_model seedvr2_ema_3b_fp16.safetensors \
+    --resolution 720 \
+    --batch_size 33 \
+    --fp8_dit \
+    --fused_vae \
+    --compile_dit
+
 # Batch directory processing with model caching
 python inference_cli.py media_folder/ \
     --output processed/ \
@@ -1038,7 +1141,7 @@ Result: Frames 0-99 with smooth blending at the transition point
 4. **For OOM errors during decoding**: Enable VAE decode tiling and reduce tile size
    - **If still getting OOM after trying all above**: Reduce batch_size or resolution
 5. **For best quality**: Use higher batch_size matching your shot length, FP16 models, and LAB color correction
-6. **For speed**: Use FP8/GGUF models, enable torch.compile, and use Flash Attention if available
+6. **For speed**: Use FP8/GGUF models, enable torch.compile, and use Flash Attention if available. On an RTX 40 series or newer GPU, also enable `fp8_dit` and `fused_vae` (see [⚡ Inference Acceleration](#-inference-acceleration))
 7. **Test settings with a short clip first** before processing long videos
 
 ## 🤝 Contributing
